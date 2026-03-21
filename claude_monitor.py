@@ -10,6 +10,8 @@ Usage:
     python3 claude_monitor.py
 """
 
+from collections import OrderedDict
+from datetime import datetime, timedelta
 import glob
 import json
 import os
@@ -146,6 +148,204 @@ def _extract_text(msg):
     return ""
 
 
+# ── Usage stats ────────────────────────────────────────────────────────
+STATS_CACHE = os.path.join(CLAUDE_DIR, "stats-cache.json")
+RATE_LIMITS_FILE = os.path.join(CLAUDE_DIR, "rate-limits.json")
+USAGE_POLL_MS = 60_000  # poll /usage every 60 seconds
+
+
+def _load_usage_stats():
+    """Compute usage directly from JSONL session files."""
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    week_ago = time.time() - 7 * 86400
+    five_h_ago = time.time() - 5 * 3600
+
+    stats = {
+        "today_messages": 0, "today_tokens": 0, "today_sessions": 0,
+        "week_messages": 0, "week_tokens": 0, "week_sessions": 0,
+        "five_h_messages": 0, "five_h_tokens": 0,
+        "subscription": None, "tier": None,
+        "five_h_pct": None, "seven_d_pct": None,
+        "five_h_resets": None, "seven_d_resets": None,
+    }
+
+    # Read credentials for subscription info
+    try:
+        with open(os.path.join(CLAUDE_DIR, ".credentials.json")) as f:
+            creds = json.load(f)
+        oauth = creds.get("claudeAiOauth", {})
+        stats["subscription"] = oauth.get("subscriptionType")
+        stats["tier"] = oauth.get("rateLimitTier")
+    except Exception:
+        pass
+
+    # Scan JSONL files modified in the last 7 days
+    today_session_ids = set()
+    week_session_ids = set()
+    try:
+        for proj_dir in glob.glob(os.path.join(PROJECTS_DIR, "*")):
+            if not os.path.isdir(proj_dir):
+                continue
+            for jf in glob.glob(os.path.join(proj_dir, "*.jsonl")):
+                if os.path.getmtime(jf) < week_ago:
+                    continue
+                sid = os.path.basename(jf).replace(".jsonl", "")
+                file_has_today = False
+                file_has_week = False
+                try:
+                    with open(jf) as f:
+                        for line in f:
+                            try:
+                                d = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            ts = d.get("timestamp")
+                            if not ts:
+                                continue
+                            try:
+                                epoch = datetime.fromisoformat(
+                                    ts.replace("Z", "+00:00")).timestamp()
+                            except Exception:
+                                continue
+                            msg = d.get("message", {})
+                            if not isinstance(msg, dict) or "usage" not in msg:
+                                continue
+                            u = msg["usage"]
+                            tok = (u.get("input_tokens", 0) +
+                                   u.get("output_tokens", 0))
+                            # 5-hour window
+                            if epoch >= five_h_ago:
+                                stats["five_h_messages"] += 1
+                                stats["five_h_tokens"] += tok
+                            # Today
+                            if ts.startswith(today_str):
+                                stats["today_messages"] += 1
+                                stats["today_tokens"] += tok
+                                file_has_today = True
+                            # This week
+                            if epoch >= week_ago:
+                                stats["week_messages"] += 1
+                                stats["week_tokens"] += tok
+                                file_has_week = True
+                except Exception:
+                    continue
+                if file_has_today:
+                    today_session_ids.add(sid)
+                if file_has_week:
+                    week_session_ids.add(sid)
+    except Exception:
+        pass
+
+    stats["today_sessions"] = len(today_session_ids)
+    stats["week_sessions"] = len(week_session_ids)
+    return stats
+
+
+def _scrape_usage(target):
+    """Send /usage to a Claude pane, scrape the output, then close it."""
+    _run(["tmux", "send-keys", "-t", target, "-l", "/usage"])
+    _run(["tmux", "send-keys", "-t", target, "Enter"])
+    time.sleep(4)
+
+    # Capture full scrollback (TUI renders above visible area)
+    content = _run(["tmux", "capture-pane", "-t", target, "-p", "-S", "-", "-E", "-"])
+
+    # Close the /usage screen
+    _run(["tmux", "send-keys", "-t", target, "Escape"])
+
+    # Parse
+    result = {"five_h_pct": None, "five_h_resets": None,
+              "seven_d_pct": None, "seven_d_resets": None}
+    lines = [_strip(l).strip() for l in content.splitlines()]
+
+    # Find the /usage output section (look for "Current session" and "Current week")
+    section = None
+    for line in lines:
+        low = line.lower()
+        if "current session" in low:
+            section = "5h"
+            continue
+        elif "current week" in low:
+            section = "7d"
+            continue
+        m = re.search(r'(\d+)%\s*used', line)
+        if m and section:
+            pct = int(m.group(1))
+            if section == "5h":
+                result["five_h_pct"] = pct
+            elif section == "7d":
+                result["seven_d_pct"] = pct
+        if low.startswith("resets") and section:
+            if section == "5h":
+                result["five_h_resets"] = line
+                section = None
+            elif section == "7d":
+                result["seven_d_resets"] = line
+                section = None
+
+    return result
+
+
+def _run_slash_command(target, command):
+    """Send a slash command to a pane and capture the output."""
+    # Capture scrollback before
+    before = _run(["tmux", "capture-pane", "-t", target, "-p", "-S", "-", "-E", "-"])
+    before_lines = before.splitlines()
+    before_len = len(before_lines)
+
+    # Send the command
+    _run(["tmux", "send-keys", "-t", target, "-l", command])
+    _run(["tmux", "send-keys", "-t", target, "Enter"])
+
+    # Wait and poll for output to stabilize
+    time.sleep(2)
+    last_len = 0
+    for _ in range(4):
+        snap = _run(["tmux", "capture-pane", "-t", target, "-p", "-S", "-", "-E", "-"])
+        cur_len = len(snap.splitlines())
+        if cur_len == last_len and cur_len != before_len:
+            break
+        last_len = cur_len
+        time.sleep(1)
+
+    # Also capture the visible pane (alternate screen / TUI dialogs)
+    visible = _run(["tmux", "capture-pane", "-t", target, "-p"])
+
+    # Full scrollback after
+    after = _run(["tmux", "capture-pane", "-t", target, "-p", "-S", "-", "-E", "-"])
+    after_lines = after.splitlines()
+
+    # Extract new output from scrollback delta
+    new_lines = after_lines[max(0, before_len - 2):]
+
+    # Strip ANSI and box-drawing chars
+    box_chars = set("─━═╔╗╚╝║│┌┐└┘├┤┬┴┼╭╮╰╯▏▕▔▁ ")
+    def _clean_lines(lines):
+        out = []
+        for line in lines:
+            c = _strip(line).strip()
+            if c and not set(c) <= box_chars:
+                out.append(c)
+        return out
+
+    scroll_result = _clean_lines(new_lines)
+    visible_result = _clean_lines(visible.splitlines())
+
+    # Use whichever captured more content (TUI commands render in visible pane)
+    if len(visible_result) > len(scroll_result) + 2:
+        result_lines = visible_result
+    else:
+        result_lines = scroll_result
+
+    # Close any dialog (Escape) - some commands open TUI dialogs
+    _run(["tmux", "send-keys", "-t", target, "Escape"])
+    time.sleep(0.3)
+    _run(["tmux", "send-keys", "-t", target, "Escape"])
+
+    return "\n".join(result_lines)
+
+
 # ── Tmux introspection ──────────────────────────────────────────────────
 def _has_claude_descendant(pid, depth=3):
     if depth <= 0:
@@ -214,8 +414,13 @@ def read_pane_content(target):
                 break
 
     vis_text = "\n".join(_strip(l) for l in vis_lines)
-    has_approval = ("Do you want to proceed?" in vis_text
-                    or "Yes, and don" in vis_text)
+    approval_keywords = [
+        "Do you want to proceed?", "Yes, and don",
+        "Allow once", "Allow always", "Deny",
+        "1. Yes", "2. Yes, and don", "3. No",
+        "1. Allow", "2. Allow always", "3. Deny",
+    ]
+    has_approval = any(kw in vis_text for kw in approval_keywords)
     if has_approval:
         info["status"] = "Needs approval"
         info["prompt_options"], info["prompt_desc"] = _parse_prompt_options(vis_lines)
@@ -264,30 +469,28 @@ def read_pane_content(target):
 def _parse_prompt_options(vis_lines):
     options = []
     desc_parts = []
-    in_desc = False
     for line in vis_lines:
         c = _strip(line).strip()
         if not c:
             continue
-        if any(kw in c for kw in ("Bash command", "Edit file", "Read file", "Write file")):
-            in_desc = True
+        # Capture tool/action description
+        if any(kw in c for kw in ("Bash command", "Edit file", "Read file",
+                                   "Write file", "Execute", "Run")):
             desc_parts.append(c)
             continue
-        if in_desc and "Do you want to proceed?" not in c:
-            if re.match(r"^\d+\.", c):
-                in_desc = False
-            else:
-                desc_parts.append(c)
-        m = re.match(r"(\d+)\.\s*(.+)", c)
+        # Match numbered options: "1. Yes", " 2) No", "3 - Allow", etc.
+        # Also handles leading special chars like ❯, >, ●, etc.
+        cleaned = re.sub(r'^[^\d]*', '', c)  # strip non-digit prefix
+        m = re.match(r'(\d+)\s*[.):\-]\s*(.+)', cleaned)
         if m:
-            num, label = m.group(1), re.sub(r"\s*:\s*$", "", m.group(2).strip())
+            num, label = m.group(1), m.group(2).strip().rstrip(':')
             if label and len(label) > 1:
                 options.append((num, label))
-    seen, clean = set(), []
+    # Deduplicate by option number
+    seen_nums, clean = set(), []
     for num, label in options:
-        short = label[:20]
-        if short not in seen:
-            seen.add(short)
+        if num not in seen_nums:
+            seen_nums.add(num)
             clean.append((num, label))
     return clean, " ".join(desc_parts).strip()[:200]
 
@@ -400,26 +603,71 @@ def _focus_terminal_tab(tty):
 
 
 # ── GUI ──────────────────────────────────────────────────────────────────
-COLUMNS = ("session", "pane", "model", "context", "turns", "status", "activity")
-COL_WIDTHS = dict(session=100, pane=55, model=140, context=250,
+COLUMNS = ("pane", "model", "context", "turns", "status", "activity")
+COL_WIDTHS = dict(pane=55, model=140, context=250,
                    turns=65, status=120, activity=420)
+
+AGENTS = [
+    ("Claude Code", "claude"),
+    ("Gemini CLI", "gemini"),
+    ("Codex CLI", "codex"),
+]
+
+SLASH_COMMANDS = [
+    # Session & Conversation
+    "/clear", "/compact", "/context", "/copy", "/branch", "/resume",
+    "/rename", "/rewind",
+    # File & Code
+    "/add-dir", "/diff", "/export",
+    # Config & Settings
+    "/config", "/status", "/theme", "/color", "/terminal-setup",
+    "/vim", "/keybindings",
+    # Model & Performance
+    "/model", "/effort", "/fast",
+    # Skills & Tools
+    "/skills", "/agents", "/mcp", "/hooks",
+    # Security & Permissions
+    "/permissions", "/security-review",
+    # Auth & Account
+    "/login", "/logout", "/privacy-settings",
+    # Info & Help
+    "/help", "/btw", "/doctor", "/cost", "/usage", "/stats",
+    "/insights", "/release-notes",
+    # Integrations
+    "/install-github-app", "/install-slack-app", "/chrome", "/ide",
+    # Memory & Context
+    "/memory", "/init",
+    # Platform
+    "/desktop", "/remote-control",
+    # Task & Planning
+    "/plan", "/tasks",
+    # Other
+    "/feedback", "/passes", "/upgrade", "/extra-usage",
+    "/statusline", "/pr-comments", "/review",
+]
 
 
 class Monitor:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("Claude Session Monitor")
-        root.geometry("1260x620")
+        root.geometry("1260x680")
         root.configure(bg=BG)
         root.minsize(900, 400)
-        self._targets: dict[str, str] = {}
-        self._pane_info: dict[str, dict] = {}
+        self._targets: dict[str, str] = {}       # iid -> tmux target (sess:win.pane)
+        self._pane_info: dict[str, dict] = {}     # iid -> pane content info
+        self._pane_data: dict[str, dict] = {}     # iid -> {pane_id, session, win_idx, target}
+        self._group_iids: dict[str, str] = {}     # session_name -> treeview iid
+        self._window_iids: dict[str, str] = {}    # "session:win_idx" -> treeview iid
+        self._cached_usage: dict = {}             # cached /usage scrape result
         self._build()
         self._tick()
+        self._poll_usage()
 
     def _build(self):
         self._apply_theme()
         self._build_header()
+        self._build_usage_panel()
         self._build_table()
         self._build_interact_panel()
         self._build_footer()
@@ -445,16 +693,144 @@ class Monitor:
         self.lbl_count = tk.Label(hdr, bg=BG, fg=FG, font=("Menlo", 12))
         self.lbl_count.pack(side="right")
 
+        # + button to launch new agent
+        self._launch_menu = tk.Menu(self.root, tearoff=0, bg=SURFACE, fg=FG,
+                                     activebackground=SEL_BG, activeforeground="#fff",
+                                     font=("Menlo", 12))
+
+        self._plus_btn = tk.Button(
+            hdr, text="+ Add", bg=GREEN, fg="#000",
+            activebackground="#2ea043", activeforeground="#000",
+            font=("Menlo", 13, "bold"), bd=0, padx=12, pady=4,
+            command=self._show_launch_menu)
+        self._plus_btn.pack(side="right", padx=(0, 12))
+
+        # / Commands button
+        self._slash_menu = tk.Menu(self.root, tearoff=0, bg=SURFACE, fg=FG,
+                                    activebackground=SEL_BG, activeforeground="#fff",
+                                    font=("Menlo", 12))
+        self._slash_btn = tk.Button(
+            hdr, text="/ Cmd", bg=ACCENT, fg="#000",
+            activebackground="#79b8ff", activeforeground="#000",
+            font=("Menlo", 13, "bold"), bd=0, padx=12, pady=4,
+            command=self._show_slash_menu)
+        self._slash_btn.pack(side="right", padx=(0, 8))
+
+    def _build_usage_panel(self):
+        panel = tk.Frame(self.root, bg=SURFACE, highlightbackground=BORDER,
+                          highlightthickness=1)
+        panel.pack(fill="x", padx=24, pady=(0, 4))
+
+        row = tk.Frame(panel, bg=SURFACE)
+        row.pack(fill="x", padx=12, pady=8)
+
+        self._usage_labels = {}
+        self._usage_bars = {}
+        sections = [
+            ("5h", "5 Hour Limit"),
+            ("7d", "Weekly Limit"),
+            ("today", "Today"),
+            ("plan", "Plan"),
+        ]
+        for i, (key, title) in enumerate(sections):
+            f = tk.Frame(row, bg=SURFACE)
+            f.pack(side="left", expand=True, fill="x")
+            if i > 0:
+                tk.Frame(row, bg=BORDER, width=1).pack(side="left", fill="y", padx=8)
+                f.pack(side="left", expand=True, fill="x")
+            tk.Label(f, text=title, bg=SURFACE, fg=DIM,
+                     font=("Menlo", 10)).pack(anchor="w")
+            # Progress bar for limit sections
+            if key in ("5h", "7d"):
+                bar_frame = tk.Frame(f, bg=SURFACE)
+                bar_frame.pack(anchor="w", fill="x", pady=(2, 0))
+                bar_lbl = tk.Label(bar_frame, text="\u2591" * 20, bg=SURFACE, fg=DIM,
+                                    font=("Menlo", 10))
+                bar_lbl.pack(side="left")
+                pct_lbl = tk.Label(bar_frame, text="", bg=SURFACE, fg=FG,
+                                    font=("Menlo", 10, "bold"))
+                pct_lbl.pack(side="left", padx=(6, 0))
+                self._usage_bars[key] = (bar_lbl, pct_lbl)
+            lbl = tk.Label(f, text="--", bg=SURFACE, fg=FG,
+                           font=("Menlo", 11, "bold"))
+            lbl.pack(anchor="w")
+            self._usage_labels[key] = lbl
+
+    def _update_usage_panel(self):
+        stats = _load_usage_stats()
+        usage = self._cached_usage
+
+        # 5-hour limit
+        fh_pct = usage.get("five_h_pct")
+        if fh_pct is not None:
+            self._set_limit_bar("5h", fh_pct)
+            reset_str = ""
+            if usage.get("five_h_resets"):
+                reset_str = f"  |  {usage['five_h_resets']}"
+            self._usage_labels["5h"].config(
+                text=f"{stats['five_h_messages']} msgs  |  {_fmt_tokens(stats['five_h_tokens'])} tok{reset_str}")
+        else:
+            self._set_limit_bar("5h", None)
+            self._usage_labels["5h"].config(
+                text=f"{stats['five_h_messages']} msgs  |  {_fmt_tokens(stats['five_h_tokens'])} tok")
+
+        # 7-day limit
+        sd_pct = usage.get("seven_d_pct")
+        if sd_pct is not None:
+            self._set_limit_bar("7d", sd_pct)
+            reset_str = ""
+            if usage.get("seven_d_resets"):
+                reset_str = f"  |  {usage['seven_d_resets']}"
+            self._usage_labels["7d"].config(
+                text=f"{stats['week_messages']} msgs  |  {_fmt_tokens(stats['week_tokens'])} tok  |  {stats['week_sessions']} sess{reset_str}")
+        else:
+            self._set_limit_bar("7d", None)
+            self._usage_labels["7d"].config(
+                text=f"{stats['week_messages']} msgs  |  {_fmt_tokens(stats['week_tokens'])} tok  |  {stats['week_sessions']} sess")
+
+        # Today
+        self._usage_labels["today"].config(
+            text=f"{stats['today_messages']} msgs  |  {_fmt_tokens(stats['today_tokens'])} tok  |  {stats['today_sessions']} sess")
+
+        # Plan
+        plan = stats.get("subscription") or "unknown"
+        self._usage_labels["plan"].config(text=plan.capitalize())
+
+    def _set_limit_bar(self, key, pct):
+        if key not in self._usage_bars:
+            return
+        bar_lbl, pct_lbl = self._usage_bars[key]
+        if pct is None:
+            bar_lbl.config(text="\u2591" * 20, fg=DIM)
+            pct_lbl.config(text="no data yet", fg=DIM)
+            return
+        width = 20
+        filled = round(pct / 100 * width)
+        bar = "\u2588" * filled + "\u2591" * (width - filled)
+        if pct < 50:
+            color = GREEN
+        elif pct < 80:
+            color = YELLOW
+        else:
+            color = RED
+        bar_lbl.config(text=bar, fg=color)
+        pct_lbl.config(text=f"{pct:.1f}%", fg=color)
+
+
     def _build_table(self):
         container = tk.Frame(self.root, bg=BG)
         container.pack(fill="both", expand=True, padx=24, pady=8)
 
         self.tv = ttk.Treeview(
-            container, columns=COLUMNS, show="headings", selectmode="browse")
+            container, columns=COLUMNS, show="tree headings", selectmode="browse")
         sb = ttk.Scrollbar(container, orient="vertical", command=self.tv.yview)
         self.tv.configure(yscrollcommand=sb.set)
 
-        headings = dict(session="Session", pane="Pane", model="Model",
+        # Tree column (used for session group names)
+        self.tv.heading("#0", text="Task")
+        self.tv.column("#0", width=150, minwidth=80)
+
+        headings = dict(pane="Pane", model="Model",
                         context="Context Window", turns="Turns",
                         status="Status", activity="Activity")
         for col in COLUMNS:
@@ -462,13 +838,19 @@ class Monitor:
             self.tv.column(col, width=COL_WIDTHS[col], minwidth=50)
 
         for tag, color in [("ctx_green", GREEN), ("ctx_yellow", YELLOW),
-                           ("ctx_red", RED), ("dim", DIM)]:
+                           ("ctx_red", RED), ("dim", DIM),
+                           ("group", ACCENT), ("window", DIM)]:
             self.tv.tag_configure(tag, foreground=color)
+        self.tv.tag_configure("group", font=("Menlo", 12, "bold"))
+        self.tv.tag_configure("window", font=("Menlo", 11, "italic"))
 
         self.tv.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         self.tv.bind("<Double-1>", self._on_dbl_click)
         self.tv.bind("<<TreeviewSelect>>", self._on_select)
+        self.tv.bind("<Button-3>", self._on_right_click)       # standard right-click
+        self.tv.bind("<Button-2>", self._on_right_click)        # macOS two-finger
+        self.tv.bind("<Control-Button-1>", self._on_right_click)  # Ctrl+click
 
     def _build_interact_panel(self):
         self._interact_frame = tk.Frame(self.root, bg=SURFACE,
@@ -510,14 +892,26 @@ class Monitor:
     def _update_interact_panel(self):
         sel = self.tv.selection()
         if not sel or sel[0] not in self._targets:
-            self._interact_label.config(text="Select a session above", fg=DIM)
+            # Check if a group or window row is selected
+            if sel and sel[0] in self._group_iids.values():
+                sess = [k for k, v in self._group_iids.items() if v == sel[0]]
+                name = sess[0] if sess else "?"
+                self._interact_label.config(
+                    text=f"Task: {name} — select a pane or click + to add agent", fg=ACCENT)
+            elif sel and sel[0] in self._window_iids.values():
+                wkey = [k for k, v in self._window_iids.items() if v == sel[0]]
+                name = wkey[0] if wkey else "?"
+                self._interact_label.config(
+                    text=f"Window: {name} — select a pane or click + to split here", fg=ACCENT)
+            else:
+                self._interact_label.config(text="Select a session above", fg=DIM)
             self._clear_option_buttons()
             return
         iid = sel[0]
         target = self._targets[iid]
         info = self._pane_info.get(iid, {})
         status = info.get("status", "")
-        pane_idx = self.tv.item(iid, "values")[1]
+        pane_idx = self.tv.item(iid, "values")[0]
         self._clear_option_buttons()
 
         if status == "Needs approval":
@@ -527,13 +921,10 @@ class Monitor:
             if desc:
                 label += f"  \u2502  {desc[:80]}"
             self._interact_label.config(text=label, fg=YELLOW)
-            colors = {"1": (GREEN, "#143d1f"), "2": (YELLOW, "#3d2f00"),
-                      "3": (RED, "#3d1f1f")}
             for num, lbl in options:
-                fg_c, bg_c = colors.get(num, (FG, BORDER))
                 btn = tk.Button(
-                    self._btn_frame, text=f"{num}. {lbl}", bg=bg_c, fg=fg_c,
-                    activebackground=BORDER, activeforeground="#fff",
+                    self._btn_frame, text=f"{num}. {lbl}", bg=BORDER, fg=FG,
+                    activebackground=SEL_BG, activeforeground="#fff",
                     font=("Menlo", 10, "bold"), bd=0, padx=10, pady=3,
                     command=lambda n=num, t=target: self._send_option(t, n))
                 btn.pack(side="left", padx=(0, 6))
@@ -585,6 +976,292 @@ class Monitor:
     def _on_select(self, _event):
         self._update_interact_panel()
 
+    def _get_selected_target(self):
+        """Get selection context: {session, window (optional), pane_target (optional)}."""
+        sel = self.tv.selection()
+        if not sel:
+            return None
+        iid = sel[0]
+
+        # Check if it's a session group row
+        for sess_name, giid in self._group_iids.items():
+            if giid == iid:
+                return {"session": sess_name}
+
+        # Check if it's a window row
+        for wkey, wiid in self._window_iids.items():
+            if wiid == iid:
+                sess, win = wkey.split(":", 1)
+                return {"session": sess, "window": win}
+
+        # It's a pane row — get pane data
+        pdata = self._pane_data.get(iid)
+        if pdata:
+            return {"session": pdata["session"], "window": pdata["win_idx"],
+                    "pane_target": pdata["target"], "pane_id": pdata["pane_id"]}
+
+        return None
+
+    def _show_launch_menu(self):
+        self._launch_menu.delete(0, tk.END)
+        target = self._get_selected_target()
+        menu_style = dict(tearoff=0, bg=SURFACE, fg=FG,
+                          activebackground=SEL_BG, activeforeground="#fff",
+                          font=("Menlo", 12))
+
+        # ── New Session (always) ──
+        new_sess_sub = tk.Menu(self._launch_menu, **menu_style)
+        for label, cmd in AGENTS:
+            new_sess_sub.add_command(
+                label=f"  {label}",
+                command=lambda c=cmd, l=label: self._launch_new_session(c, l))
+        self._launch_menu.add_cascade(label="  \u2795 New Session", menu=new_sess_sub)
+
+        # ── New Window (if a session is in context) ──
+        if target and "session" in target:
+            sess = target["session"]
+            new_win_sub = tk.Menu(self._launch_menu, **menu_style)
+            for label, cmd in AGENTS:
+                new_win_sub.add_command(
+                    label=f"  {label}",
+                    command=lambda c=cmd, s=sess: self._launch_new_window(c, s))
+            self._launch_menu.add_cascade(
+                label=f"  \u2795 New Window in {sess}", menu=new_win_sub)
+
+        self._launch_menu.add_separator()
+
+        # ── Split into specific window (if window or pane selected) ──
+        if target and "window" in target:
+            sess = target["session"]
+            win = target["window"]
+            for label, cmd in AGENTS:
+                self._launch_menu.add_command(
+                    label=f"  {label}  \u2192  {sess}:{win}",
+                    command=lambda c=cmd, s=sess, w=win: self._launch_split(c, s, w))
+        elif target and "session" in target:
+            sess = target["session"]
+            for label, cmd in AGENTS:
+                self._launch_menu.add_command(
+                    label=f"  {label}  \u2192  {sess}",
+                    command=lambda c=cmd, s=sess: self._launch_split(c, s))
+        else:
+            # Nothing selected — list all sessions
+            raw = _run(["tmux", "list-sessions", "-F", "#{session_name}"])
+            sessions = [s.strip() for s in raw.strip().splitlines() if s.strip()]
+            for s in sessions:
+                sub = tk.Menu(self._launch_menu, **menu_style)
+                for label, cmd in AGENTS:
+                    sub.add_command(
+                        label=f"  {label}",
+                        command=lambda c=cmd, ss=s: self._launch_split(c, ss))
+                self._launch_menu.add_cascade(label=f"  Split in {s}", menu=sub)
+
+        self.root.update_idletasks()
+        x = self._plus_btn.winfo_rootx()
+        y = self._plus_btn.winfo_rooty() + self._plus_btn.winfo_height()
+        try:
+            self._launch_menu.tk_popup(x, y, 0)
+        finally:
+            self._launch_menu.grab_release()
+
+    def _launch_new_session(self, cmd, label):
+        """Create a brand new tmux session running the given agent."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"New Session — {label}")
+        dialog.geometry("400x130")
+        dialog.configure(bg=SURFACE)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(dialog, text="Session name:", bg=SURFACE, fg=FG,
+                 font=("Menlo", 12)).pack(pady=(16, 4), padx=16, anchor="w")
+        entry = tk.Entry(dialog, bg=BG, fg=FG, insertbackground=ACCENT,
+                         font=("Menlo", 13), bd=0, highlightbackground=BORDER,
+                         highlightcolor=ACCENT, highlightthickness=1)
+        entry.pack(fill="x", padx=16)
+        entry.focus_set()
+
+        def _create(_event=None):
+            name = entry.get().strip()
+            if not name:
+                return
+            name = re.sub(r"[^a-zA-Z0-9_-]", "-", name)
+            dialog.destroy()
+            _run(["tmux", "new-session", "-d", "-s", name, cmd])
+            self.root.after(1500, self._refresh)
+
+        entry.bind("<Return>", _create)
+        btn_frame = tk.Frame(dialog, bg=SURFACE)
+        btn_frame.pack(fill="x", padx=16, pady=(10, 12))
+        tk.Button(btn_frame, text="Cancel", bg=BORDER, fg=FG,
+                  font=("Menlo", 11), bd=0, padx=12, pady=3,
+                  command=dialog.destroy).pack(side="right")
+        tk.Button(btn_frame, text="Create", bg=GREEN, fg="#000",
+                  activebackground="#2ea043", activeforeground="#000",
+                  font=("Menlo", 11, "bold"), bd=0, padx=12, pady=3,
+                  command=_create).pack(side="right", padx=(0, 8))
+
+    def _launch_new_window(self, cmd, session):
+        """Create a new tmux window in the given session with the agent."""
+        _run(["tmux", "new-window", "-t", session, cmd])
+        self.root.after(1500, self._refresh)
+
+    def _launch_split(self, cmd, session, window=None):
+        """Split a pane in the given session (optionally specific window)."""
+        target = f"{session}:{window}" if window else session
+        _run(["tmux", "split-window", "-t", target, cmd])
+        self.root.after(1500, self._refresh)
+
+    # ── Slash commands ──
+    def _resolve_target(self, iid=None):
+        """Resolve a tree selection to a tmux pane target.
+        Works for pane, window, or session rows (picks first child pane)."""
+        if iid and iid in self._targets:
+            return self._targets[iid]
+        # Walk children to find first pane target
+        if iid:
+            for child in self.tv.get_children(iid):
+                t = self._resolve_target(child)
+                if t:
+                    return t
+        return None
+
+    def _show_slash_menu(self):
+        sel = self.tv.selection()
+        if not sel:
+            self._interact_label.config(
+                text="Select a pane first to run a / command", fg=YELLOW)
+            return
+        target = self._resolve_target(sel[0])
+        if not target:
+            self._interact_label.config(
+                text="Select a pane first to run a / command", fg=YELLOW)
+            return
+        self._slash_menu.delete(0, tk.END)
+        for cmd in SLASH_COMMANDS:
+            self._slash_menu.add_command(
+                label=f"  {cmd}",
+                command=lambda c=cmd, t=target: self._exec_slash_command(t, c))
+        self.root.update_idletasks()
+        x = self._slash_btn.winfo_rootx()
+        y = self._slash_btn.winfo_rooty() + self._slash_btn.winfo_height()
+        try:
+            self._slash_menu.tk_popup(x, y, 0)
+        finally:
+            self._slash_menu.grab_release()
+
+    def _exec_slash_command(self, target, command):
+        """Run a slash command in a background thread and show result in popup."""
+        import threading
+
+        # Show loading indicator
+        self._interact_label.config(text=f"Running {command}...", fg=ACCENT)
+
+        def _do():
+            result = _run_slash_command(target, command)
+            self.root.after(0, lambda: self._show_result_popup(command, target, result))
+
+        t = threading.Thread(target=_do, daemon=True)
+        t.start()
+
+    def _show_result_popup(self, command, target, result):
+        self._interact_label.config(text=f"{command} completed", fg=GREEN)
+
+        popup = tk.Toplevel(self.root)
+        popup.title(f"{command}  —  {target}")
+        popup.geometry("700x500")
+        popup.configure(bg=BG)
+        popup.transient(self.root)
+
+        # Header
+        hdr = tk.Frame(popup, bg=SURFACE)
+        hdr.pack(fill="x", padx=0, pady=0)
+        tk.Label(hdr, text=f"  {command}  —  {target}", bg=SURFACE, fg=ACCENT,
+                 font=("Menlo", 14, "bold")).pack(side="left", pady=8, padx=8)
+        tk.Button(hdr, text="Close", bg=BORDER, fg=FG,
+                  font=("Menlo", 11), bd=0, padx=12, pady=4,
+                  command=popup.destroy).pack(side="right", padx=8, pady=8)
+
+        # Content
+        text = tk.Text(popup, bg=SURFACE, fg=FG, font=("Menlo", 12),
+                       wrap="word", bd=0, padx=16, pady=12,
+                       insertbackground=ACCENT,
+                       highlightbackground=BORDER, highlightthickness=1)
+        sb = ttk.Scrollbar(popup, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        text.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+        text.insert("1.0", result if result.strip() else "(no output)")
+        text.config(state="disabled")
+
+        # Bind Escape to close
+        popup.bind("<Escape>", lambda e: popup.destroy())
+
+    # ── Right-click context menu (move panes) ──
+    def _on_right_click(self, event):
+        iid = self.tv.identify_row(event.y)
+        if not iid or iid not in self._pane_data:
+            return
+        self.tv.selection_set(iid)
+        pdata = self._pane_data[iid]
+        menu_style = dict(tearoff=0, bg=SURFACE, fg=FG,
+                          activebackground=SEL_BG, activeforeground="#fff",
+                          font=("Menlo", 12))
+        ctx = tk.Menu(self.root, **menu_style)
+
+        # Move to → submenu with all session:window targets
+        move_sub = tk.Menu(ctx, **menu_style)
+        for wkey in sorted(self._window_iids.keys()):
+            # Skip current window
+            cur_key = f"{pdata['session']}:{pdata['win_idx']}"
+            if wkey == cur_key:
+                continue
+            move_sub.add_command(
+                label=f"  {wkey}",
+                command=lambda w=wkey, pd=pdata: self._move_pane_to(pd, w))
+
+        # "Move to new window" option
+        move_sub.add_separator()
+        move_sub.add_command(
+            label="  \u2795 New window",
+            command=lambda pd=pdata: self._break_pane(pd))
+        ctx.add_cascade(label="  Move to...", menu=move_sub)
+
+        # Reorder within window
+        ctx.add_separator()
+        ctx.add_command(label="  \u2191 Move Up",
+                        command=lambda pd=pdata: self._swap_pane(pd, "U"))
+        ctx.add_command(label="  \u2193 Move Down",
+                        command=lambda pd=pdata: self._swap_pane(pd, "D"))
+
+        # / Commands submenu
+        ctx.add_separator()
+        slash_sub = tk.Menu(ctx, **menu_style)
+        target = pdata["target"]
+        for cmd in SLASH_COMMANDS:
+            slash_sub.add_command(
+                label=f"  {cmd}",
+                command=lambda c=cmd, t=target: self._exec_slash_command(t, c))
+        ctx.add_cascade(label="  / Commands", menu=slash_sub)
+
+        ctx.tk_popup(event.x_root, event.y_root)
+
+    def _move_pane_to(self, pdata, target_wkey):
+        """Move a pane to a different window using tmux join-pane."""
+        _run(["tmux", "join-pane", "-s", pdata["pane_id"], "-t", target_wkey])
+        self.root.after(800, self._refresh)
+
+    def _break_pane(self, pdata):
+        """Break a pane out into its own new window."""
+        _run(["tmux", "break-pane", "-s", pdata["pane_id"]])
+        self.root.after(800, self._refresh)
+
+    def _swap_pane(self, pdata, direction):
+        """Swap pane up (U) or down (D) within its window."""
+        _run(["tmux", "swap-pane", "-t", pdata["target"],
+              f"-{direction}"])
+        self.root.after(800, self._refresh)
+
     def _build_footer(self):
         ft = tk.Frame(self.root, bg=BG)
         ft.pack(fill="x", padx=24, pady=(0, 14))
@@ -608,9 +1285,29 @@ class Monitor:
     def _manual_refresh(self):
         self._refresh()
 
+    def _poll_usage(self):
+        """Scrape /usage from an idle Claude pane every 60s (in background)."""
+        import threading
+
+        def _do_poll():
+            # Find an idle pane
+            panes = get_claude_panes()
+            for p in panes:
+                info = read_pane_content(p["target"])
+                if info["status"] in ("Idle", "Waiting for input"):
+                    result = _scrape_usage(p["target"])
+                    if result.get("five_h_pct") is not None:
+                        self._cached_usage = result
+                    break
+
+        t = threading.Thread(target=_do_poll, daemon=True)
+        t.start()
+        self.root.after(USAGE_POLL_MS, self._poll_usage)
+
     def _refresh(self):
         now = time.strftime("%H:%M:%S")
         self.lbl_updated.config(text=f"Last updated: {now}")
+        self._update_usage_panel()
 
         prev_sel = None
         sel = self.tv.selection()
@@ -621,52 +1318,87 @@ class Monitor:
             self.tv.delete(i)
         self._targets.clear()
         self._pane_info.clear()
+        self._pane_data.clear()
+        self._group_iids.clear()
+        self._window_iids.clear()
 
         panes = get_claude_panes()
         n = len(panes)
-        self.lbl_count.config(text=f"{n} session{'s' * (n != 1)}")
+        self.lbl_count.config(text=f"{n} pane{'s' * (n != 1)}")
 
         if not panes:
-            self.tv.insert("", "end", tags=("dim",), values=(
-                "\u2014", "\u2014", "\u2014", "No sessions detected",
+            self.tv.insert("", "end", text="", tags=("dim",), values=(
+                "\u2014", "\u2014", "No sessions detected",
                 "\u2014", "\u2014", "Start claude inside a tmux window"))
             self._update_interact_panel()
             return
 
+        # Group panes: session → window → panes
+        groups: dict[str, dict[str, list]] = OrderedDict()
+        for p in panes:
+            sess = p["session"]
+            win = p["win_idx"]
+            groups.setdefault(sess, OrderedDict()).setdefault(win, []).append(p)
+
         all_sessions = _load_all_sessions()
         restore_iid = None
 
-        for p in panes:
-            pane_info = read_pane_content(p["target"])
-            sid = match_pane_to_session(pane_info, all_sessions)
-            sdata = all_sessions.get(sid, {}) if sid else {}
+        for sess_name, windows in groups.items():
+            total_panes = sum(len(pl) for pl in windows.values())
+            # Session row
+            group_iid = self.tv.insert(
+                "", "end",
+                text=f"\u25b8 {sess_name}  ({total_panes} pane{'s' * (total_panes != 1)}, {len(windows)} win)",
+                tags=("group",), values=("", "", "", "", "", ""), open=True)
+            self._group_iids[sess_name] = group_iid
 
-            input_tok = sdata.get("input_tokens", 0)
-            pct = sdata.get("ctx_pct", 0)
-            if input_tok > 0:
-                ctx_str = f"{_bar(pct)} {_fmt_tokens(input_tok)}/{_fmt_tokens(CONTEXT_WINDOW)} ({pct:.0f}%)"
-                tag = "ctx_green" if pct < 50 else "ctx_yellow" if pct < 80 else "ctx_red"
-            else:
-                ctx_str = f"{_bar(0)} 0/{_fmt_tokens(CONTEXT_WINDOW)} (0%)"
-                tag = "ctx_green"
+            for win_idx, win_panes in windows.items():
+                win_name = win_panes[0].get("win_name", "")
+                wkey = f"{sess_name}:{win_idx}"
+                # Window row
+                win_iid = self.tv.insert(
+                    group_iid, "end",
+                    text=f"  \u25ab Window {win_idx}: {win_name}" if win_name else f"  \u25ab Window {win_idx}",
+                    tags=("window",), values=("", "", "", "", "", ""), open=True)
+                self._window_iids[wkey] = win_iid
 
-            model_str = pane_info.get("model") or sdata.get("model") or "\u2014"
-            turns = str(sdata.get("num_turns", 0))
-            status = pane_info["status"]
-            status_icons = {
-                "Idle": "\u25cf Idle", "Working": "\u25cf Working",
-                "Waiting for input": "\u25cf Waiting",
-                "Needs approval": "\u26a0 Approval",
-            }
+                for p in win_panes:
+                    pane_info = read_pane_content(p["target"])
+                    sid = match_pane_to_session(pane_info, all_sessions)
+                    sdata = all_sessions.get(sid, {}) if sid else {}
 
-            iid = self.tv.insert("", "end", tags=(tag,), values=(
-                p["session"], p["pane_idx"], model_str, ctx_str, turns,
-                status_icons.get(status, status),
-                (pane_info["activity"] or "\u2014")[:80]))
-            self._targets[iid] = p["target"]
-            self._pane_info[iid] = pane_info
-            if p["target"] == prev_sel:
-                restore_iid = iid
+                    input_tok = sdata.get("input_tokens", 0)
+                    pct = sdata.get("ctx_pct", 0)
+                    if input_tok > 0:
+                        ctx_str = f"{_bar(pct)} {_fmt_tokens(input_tok)}/{_fmt_tokens(CONTEXT_WINDOW)} ({pct:.0f}%)"
+                        tag = "ctx_green" if pct < 50 else "ctx_yellow" if pct < 80 else "ctx_red"
+                    else:
+                        ctx_str = f"{_bar(0)} 0/{_fmt_tokens(CONTEXT_WINDOW)} (0%)"
+                        tag = "ctx_green"
+
+                    model_str = pane_info.get("model") or sdata.get("model") or "\u2014"
+                    turns = str(sdata.get("num_turns", 0))
+                    status = pane_info["status"]
+                    status_icons = {
+                        "Idle": "\u25cf Idle", "Working": "\u25cf Working",
+                        "Waiting for input": "\u25cf Waiting",
+                        "Needs approval": "\u26a0 Approval",
+                    }
+
+                    iid = self.tv.insert(win_iid, "end", text="", tags=(tag,), values=(
+                        p["pane_idx"], model_str, ctx_str, turns,
+                        status_icons.get(status, status),
+                        (pane_info["activity"] or "\u2014")[:80]))
+                    self._targets[iid] = p["target"]
+                    self._pane_info[iid] = pane_info
+                    self._pane_data[iid] = {
+                        "pane_id": p["pane_id"],
+                        "session": p["session"],
+                        "win_idx": p["win_idx"],
+                        "target": p["target"],
+                    }
+                    if p["target"] == prev_sel:
+                        restore_iid = iid
 
         if restore_iid:
             self.tv.selection_set(restore_iid)
@@ -675,8 +1407,12 @@ class Monitor:
 
     def _on_dbl_click(self, _event):
         sel = self.tv.selection()
-        if sel and sel[0] in self._targets:
-            attach(self._targets[sel[0]])
+        if not sel:
+            return
+        iid = sel[0]
+        if iid in self._targets:
+            attach(self._targets[iid])
+        # If it's a group row, just toggle open/close (default treeview behavior)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────

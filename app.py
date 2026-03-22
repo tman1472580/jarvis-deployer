@@ -15,7 +15,7 @@ from backend.tmux import (
 )
 from backend.sessions import (
     CONTEXT_WINDOW, _load_all_sessions, _load_usage_stats,
-    _scrape_usage, match_pane_to_session,
+    match_pane_to_session,
 )
 from backend.commands import (
     AGENTS, SLASH_COMMANDS, send_keys, attach, select_pane,
@@ -165,8 +165,12 @@ def run_swap_pane(target, direction):
 
 @eel.expose
 def refresh_usage():
-    """Manually trigger a /usage scrape and return updated stats."""
-    _do_usage_scrape()
+    """Re-read rate-limits.json and return updated stats."""
+    from backend.sessions import _read_rate_limits
+    rl = _read_rate_limits()
+    if rl.get("five_h_pct") is not None:
+        with _usage_cache_lock:
+            _usage_cache.update(rl)
     return get_usage_stats()
 
 
@@ -190,34 +194,18 @@ def get_slash_commands():
 
 # ── Background usage poller ──────────────────────────────────────────────
 
-def _do_usage_scrape():
-    """Attempt to scrape /usage from an idle Claude pane."""
-    try:
-        panes = get_claude_panes()
-        for p in panes:
-            info = read_pane_content(p["target"])
-            if info["status"] in ("Idle", "Waiting for input"):
-                result = _scrape_usage(p["target"])
-                if result.get("five_h_pct") is not None:
-                    with _usage_cache_lock:
-                        _usage_cache.update(result)
-                return True
-    except Exception:
-        pass
-    return False
-
-
 def _usage_poller():
-    """Poll /usage from an idle Claude pane: immediately, then every 60s."""
-    # Initial scrape with short retry
-    for _ in range(3):
-        if _do_usage_scrape():
-            break
-        time.sleep(5)
-    # Then poll every 60s
+    """Re-read rate-limits.json every 2 minutes to keep usage cache fresh."""
     while True:
-        time.sleep(60)
-        _do_usage_scrape()
+        try:
+            from backend.sessions import _read_rate_limits
+            rl = _read_rate_limits()
+            if rl.get("five_h_pct") is not None:
+                with _usage_cache_lock:
+                    _usage_cache.update(rl)
+        except Exception:
+            pass
+        time.sleep(120)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useRef } from "react"
 import { eel, type PaneData, type UsageStats } from "@/lib/eel-bridge"
 
 const STATE_POLL_MS = 3000
-const USAGE_POLL_MS = 60000
+const USAGE_POLL_MS = 120000
 
 export function useEelState() {
   const [panes, setPanes] = useState<PaneData[]>([])

@@ -188,11 +188,42 @@ def _load_usage_stats():
 
     stats["today_sessions"] = len(today_session_ids)
     stats["week_sessions"] = len(week_session_ids)
+
+    # Merge rate limits from local file (much more reliable than scraping)
+    rl = _read_rate_limits()
+    stats.update(rl)
+
     return stats
 
 
+def _read_rate_limits():
+    """Read usage percentages directly from ~/.claude/rate-limits.json."""
+    result = {"five_h_pct": None, "five_h_resets": None,
+              "seven_d_pct": None, "seven_d_resets": None}
+    try:
+        path = os.path.join(CLAUDE_DIR, "rate-limits.json")
+        with open(path) as f:
+            data = json.load(f)
+        rl = data.get("rate_limits", {})
+        five = rl.get("five_hour", {})
+        seven = rl.get("seven_day", {})
+        if "used_percentage" in five:
+            result["five_h_pct"] = five["used_percentage"]
+        if "resets_at" in five:
+            result["five_h_resets"] = datetime.fromtimestamp(
+                five["resets_at"]).strftime("Resets at %I:%M %p")
+        if "used_percentage" in seven:
+            result["seven_d_pct"] = seven["used_percentage"]
+        if "resets_at" in seven:
+            result["seven_d_resets"] = datetime.fromtimestamp(
+                seven["resets_at"]).strftime("Resets %a %I:%M %p")
+    except Exception:
+        pass
+    return result
+
+
 def _scrape_usage(target):
-    """Send /usage to a Claude pane, scrape the output, then close it."""
+    """Legacy: Send /usage to a Claude pane and scrape the output."""
     from .tmux import _run, _strip
 
     _run(["tmux", "send-keys", "-t", target, "-l", "/usage"])
@@ -210,20 +241,26 @@ def _scrape_usage(target):
     section = None
     for line in lines:
         low = line.lower()
-        if "current session" in low:
+        if any(k in low for k in ("current session", "5-hour", "5 hour", "daily")):
             section = "5h"
+            m = re.search(r'(\d+)%', line)
+            if m:
+                result["five_h_pct"] = int(m.group(1))
             continue
-        elif "current week" in low:
+        elif any(k in low for k in ("current week", "weekly", "7-day", "7 day")):
             section = "7d"
+            m = re.search(r'(\d+)%', line)
+            if m:
+                result["seven_d_pct"] = int(m.group(1))
             continue
-        m = re.search(r'(\d+)%\s*used', line)
+        m = re.search(r'(\d+)%', line)
         if m and section:
             pct = int(m.group(1))
-            if section == "5h":
+            if section == "5h" and result["five_h_pct"] is None:
                 result["five_h_pct"] = pct
-            elif section == "7d":
+            elif section == "7d" and result["seven_d_pct"] is None:
                 result["seven_d_pct"] = pct
-        if low.startswith("resets") and section:
+        if "reset" in low and section:
             if section == "5h":
                 result["five_h_resets"] = line
                 section = None

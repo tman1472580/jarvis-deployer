@@ -178,6 +178,14 @@ export default function AICommandCenter() {
     setTimeout(refresh, 800)
   }, [selectedTask, refresh])
 
+  const handleSelectTask = useCallback(async (taskId: string | null) => {
+    setSelectedTaskId(taskId)
+    if (taskId) {
+      const task = tasksMap.get(taskId)
+      if (task) await eel.selectPane(task.target)
+    }
+  }, [tasksMap])
+
   const handleAttach = useCallback(async (taskId: string) => {
     const task = tasksMap.get(taskId)
     if (task) await eel.attach(task.target)
@@ -246,9 +254,9 @@ export default function AICommandCenter() {
       }
       return newStacks
     })
-    setSelectedTaskId(taskId)
+    handleSelectTask(taskId)
     bringToFront(stackIndex)
-  }, [bringToFront])
+  }, [bringToFront, handleSelectTask])
 
   const handleStackItemDragOut = useCallback((stackIndex: number, taskId: string, position: { x: number; y: number }) => {
     let targetFolderId: string | null = null
@@ -293,9 +301,9 @@ export default function AICommandCenter() {
       return [...prev.slice(0, folderStacks.length), maxZ + 1]
     })
     if (!targetFolderId) setMaxZ(prev => prev + 1)
-    setSelectedTaskId(taskId)
+    handleSelectTask(taskId)
     setDragTargetFolderId(null)
-  }, [folderStacks, maxZ])
+  }, [folderStacks, maxZ, handleSelectTask])
 
   const handleFolderDrag = useCallback((stackIndex: number, currentPosition: { x: number; y: number }) => {
     const currentStack = folderStacks[stackIndex]
@@ -376,11 +384,14 @@ export default function AICommandCenter() {
     bringToFront(stackIndex)
   }, [bringToFront])
 
-  const handleClose = useCallback((stackIndex: number) => {
+  const handleClose = useCallback(async (stackIndex: number) => {
     const stack = folderStacks[stackIndex]
     if (!stack) return
-    // Hide this folder so polls don't recreate it
-    setHiddenFolderIds(prev => new Set([...prev, stack.id]))
+    // Get session name from the first task in the folder
+    const firstTask = tasksMap.get(stack.taskIds[0])
+    if (firstTask) {
+      await eel.killSession(firstTask.session)
+    }
     setFolderStacks(prev => {
       const newStacks = [...prev]
       newStacks.splice(stackIndex, 1)
@@ -392,7 +403,8 @@ export default function AICommandCenter() {
       return newIndices
     })
     if (selectedTaskId && stack.taskIds.includes(selectedTaskId)) setSelectedTaskId(null)
-  }, [folderStacks, selectedTaskId])
+    setTimeout(refresh, 500)
+  }, [folderStacks, selectedTaskId, tasksMap, refresh])
 
   const handleBackgroundClick = () => setSelectedTaskId(null)
 
@@ -547,7 +559,7 @@ export default function AICommandCenter() {
                 stackedTasks={stackedTasks}
                 isSelected={selectedTaskId === frontTask.id}
                 isMinimized={stack.isMinimized}
-                onClick={() => setSelectedTaskId(selectedTaskId === frontTask.id ? null : frontTask.id)}
+                onClick={() => handleSelectTask(selectedTaskId === frontTask.id ? null : frontTask.id)}
                 onStackItemClick={(taskId) => handleStackItemClick(stackIndex, taskId)}
                 onStackItemDragOut={(taskId, pos) => handleStackItemDragOut(stackIndex, taskId, pos)}
                 initialPosition={stack.position}

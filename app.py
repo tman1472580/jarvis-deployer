@@ -18,9 +18,9 @@ from backend.sessions import (
     _scrape_usage, match_pane_to_session,
 )
 from backend.commands import (
-    AGENTS, SLASH_COMMANDS, send_keys, attach,
+    AGENTS, SLASH_COMMANDS, send_keys, attach, select_pane,
     _run_slash_command, move_pane_to, break_pane, swap_pane,
-    new_session, new_window, split_window,
+    new_session, new_window, split_window, kill_session,
 )
 
 # ── Initialize Eel ──────────────────────────────────────────────────────
@@ -98,6 +98,12 @@ def run_send_keys(target, text, enter=True):
 
 
 @eel.expose
+def run_select_pane(target):
+    """Select a pane in tmux without opening a terminal."""
+    select_pane(target)
+
+
+@eel.expose
 def run_attach(target):
     """Open terminal and attach to a tmux pane."""
     attach(target)
@@ -158,6 +164,19 @@ def run_swap_pane(target, direction):
 
 
 @eel.expose
+def refresh_usage():
+    """Manually trigger a /usage scrape and return updated stats."""
+    _do_usage_scrape()
+    return get_usage_stats()
+
+
+@eel.expose
+def run_kill_session(session):
+    """Kill a tmux session."""
+    kill_session(session)
+
+
+@eel.expose
 def get_agents():
     """Return list of available agents."""
     return [{"label": label, "cmd": cmd} for label, cmd in AGENTS]
@@ -171,22 +190,34 @@ def get_slash_commands():
 
 # ── Background usage poller ──────────────────────────────────────────────
 
+def _do_usage_scrape():
+    """Attempt to scrape /usage from an idle Claude pane."""
+    try:
+        panes = get_claude_panes()
+        for p in panes:
+            info = read_pane_content(p["target"])
+            if info["status"] in ("Idle", "Waiting for input"):
+                result = _scrape_usage(p["target"])
+                if result.get("five_h_pct") is not None:
+                    with _usage_cache_lock:
+                        _usage_cache.update(result)
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _usage_poller():
-    """Poll /usage from an idle Claude pane every 60s."""
+    """Poll /usage from an idle Claude pane: immediately, then every 60s."""
+    # Initial scrape with short retry
+    for _ in range(3):
+        if _do_usage_scrape():
+            break
+        time.sleep(5)
+    # Then poll every 60s
     while True:
         time.sleep(60)
-        try:
-            panes = get_claude_panes()
-            for p in panes:
-                info = read_pane_content(p["target"])
-                if info["status"] in ("Idle", "Waiting for input"):
-                    result = _scrape_usage(p["target"])
-                    if result.get("five_h_pct") is not None:
-                        with _usage_cache_lock:
-                            _usage_cache.update(result)
-                    break
-        except Exception:
-            pass
+        _do_usage_scrape()
 
 
 # ── Entry point ──────────────────────────────────────────────────────────

@@ -56,6 +56,14 @@ def send_keys(target, text, enter=False):
         _run(["tmux", "send-keys", "-t", target, "Enter"])
 
 
+# ── Pane selection ──────────────────────────────────────────────────────
+def select_pane(target):
+    """Select a pane in tmux (window + pane) without opening a terminal."""
+    session_window = target.rsplit(".", 1)[0]
+    _run(["tmux", "select-window", "-t", session_window])
+    _run(["tmux", "select-pane", "-t", target])
+
+
 # ── Attach / focus ──────────────────────────────────────────────────────
 def attach(target):
     session_window = target.rsplit(".", 1)[0]
@@ -67,7 +75,12 @@ def attach(target):
         tty = clients.strip().splitlines()[0]
         if _focus_terminal_tab(tty):
             return
-    attach_cmd = f"tmux attach-session -t '{session}'"
+    # Select pane right before attach so there's no race condition
+    attach_cmd = (
+        f"tmux select-window -t '{session_window}' && "
+        f"tmux select-pane -t '{target}' && "
+        f"tmux attach-session -t '{session}'"
+    )
     iterm_script = (
         'tell application "System Events"\n'
         '  if exists (processes where name is "iTerm2") then\n'
@@ -217,3 +230,8 @@ def split_window(cmd, session, window=None):
     """Split a pane in the given session (optionally specific window)."""
     target = f"{session}:{window}" if window else session
     _run(["tmux", "split-window", "-t", target, cmd])
+
+
+def kill_session(session):
+    """Kill an entire tmux session."""
+    _run(["tmux", "kill-session", "-t", session])

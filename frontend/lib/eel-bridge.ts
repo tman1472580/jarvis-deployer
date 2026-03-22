@@ -83,6 +83,16 @@ export const eel = {
   getFullState: () =>
     callEel<PaneData[]>(() => window.eel.get_full_state(), []),
 
+  refreshUsage: () =>
+    callEel<UsageStats>(() => window.eel.refresh_usage(), {
+      today_messages: 0, today_tokens: 0, today_sessions: 0,
+      week_messages: 0, week_tokens: 0, week_sessions: 0,
+      five_h_messages: 0, five_h_tokens: 0,
+      subscription: null, tier: null,
+      five_h_pct: null, seven_d_pct: null,
+      five_h_resets: null, seven_d_resets: null,
+    }),
+
   getUsageStats: () =>
     callEel<UsageStats>(() => window.eel.get_usage_stats(), {
       today_messages: 0, today_tokens: 0, today_sessions: 0,
@@ -95,6 +105,9 @@ export const eel = {
 
   sendKeys: (target: string, text: string, enter = true) =>
     callEel(() => window.eel.run_send_keys(target, text, enter), undefined),
+
+  selectPane: (target: string) =>
+    callEel(() => window.eel.run_select_pane(target), undefined),
 
   attach: (target: string) =>
     callEel(() => window.eel.run_attach(target), undefined),
@@ -125,6 +138,9 @@ export const eel = {
 
   swapPane: (target: string, direction: string) =>
     callEel(() => window.eel.run_swap_pane(target, direction), undefined),
+
+  killSession: (session: string) =>
+    callEel(() => window.eel.run_kill_session(session), undefined),
 
   getAgents: () =>
     callEel<AgentDef[]>(() => window.eel.get_agents(), []),

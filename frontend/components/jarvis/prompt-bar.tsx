@@ -1,30 +1,40 @@
 "use client"
 
 import { useState, useRef, useEffect } from "react"
-import { Send, Zap, XCircle } from "lucide-react"
+import { Send, Zap, XCircle, Wand2, ChevronDown } from "lucide-react"
+import type { SkillDef } from "@/lib/eel-bridge"
 
 interface PromptBarProps {
   selectedTask: string | null
+  agentType?: "claude" | "gemini" | "codex"
   onSend: (message: string) => void
   promptOptions?: [string, string][]
   promptDesc?: string
   taskStatus?: string
   onSendOption?: (num: string) => void
   onSendEscape?: () => void
+  skills?: SkillDef[]
+  onRunSkill?: (skillSlug: string, userPrompt: string) => void
 }
 
 export function PromptBar({
   selectedTask,
+  agentType = "claude",
   onSend,
   promptOptions,
   promptDesc,
   taskStatus,
   onSendOption,
   onSendEscape,
+  skills = [],
+  onRunSkill,
 }: PromptBarProps) {
   const [message, setMessage] = useState("")
   const [isFocused, setIsFocused] = useState(false)
+  const [showSkills, setShowSkills] = useState(false)
+  const [pendingSkill, setPendingSkill] = useState<SkillDef | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const skillsRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (selectedTask && inputRef.current) {
@@ -32,8 +42,25 @@ export function PromptBar({
     }
   }, [selectedTask])
 
+  // Close skill dropdown on outside click
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (skillsRef.current && !skillsRef.current.contains(e.target as Node)) {
+        setShowSkills(false)
+      }
+    }
+    document.addEventListener("mousedown", handler)
+    return () => document.removeEventListener("mousedown", handler)
+  }, [])
+
   const handleSend = () => {
-    if (message.trim() && selectedTask) {
+    if (!selectedTask) return
+    if (pendingSkill) {
+      // Send skill with the typed message as user request
+      onRunSkill?.(pendingSkill.slug, message.trim())
+      setPendingSkill(null)
+      setMessage("")
+    } else if (message.trim()) {
       onSend(message)
       setMessage("")
     }
@@ -44,14 +71,44 @@ export function PromptBar({
       e.preventDefault()
       handleSend()
     }
+    if (e.key === "Escape" && pendingSkill) {
+      setPendingSkill(null)
+      setMessage("")
+    }
   }
 
+  const handleSelectSkill = (skill: SkillDef) => {
+    setShowSkills(false)
+    setPendingSkill(skill)
+    setMessage("")
+    setTimeout(() => inputRef.current?.focus(), 50)
+  }
+
+  const agentLabel = agentType === "gemini" ? "Gemini" : agentType === "codex" ? "Codex" : "Claude"
+  const agentColor = agentType === "gemini" ? "text-blue-400" : agentType === "codex" ? "text-purple-400" : "text-cyan-400"
   const hasApproval = taskStatus === "Approval" && promptOptions && promptOptions.length > 0
 
   return (
     <div className="relative">
       {/* Decorative top line */}
       <div className="h-px bg-gradient-to-r from-transparent via-cyan-500/50 to-transparent mb-3" />
+
+      {/* Pending skill banner */}
+      {pendingSkill && (
+        <div className="mb-2 px-2 flex items-center gap-2">
+          <Wand2 size={12} className="text-violet-400 shrink-0" />
+          <span className="text-[10px] font-mono text-violet-300 uppercase tracking-wider">
+            Skill: {pendingSkill.name}
+          </span>
+          <span className="text-[10px] font-mono text-violet-500/60">— type your request below, then send</span>
+          <button
+            onClick={() => { setPendingSkill(null); setMessage("") }}
+            className="ml-auto text-violet-500/60 hover:text-violet-300 text-[10px] font-mono"
+          >
+            ✕ cancel
+          </button>
+        </div>
+      )}
 
       {/* Approval section */}
       {hasApproval && (
@@ -113,8 +170,13 @@ export function PromptBar({
         {/* Input area */}
         <div className="flex-1 relative">
           {selectedTask && (
-            <div className="absolute -top-1 left-0 text-[9px] font-mono text-cyan-500/70 tracking-wider uppercase">
-              Target: {selectedTask}
+            <div className="absolute -top-1 left-0 flex items-center gap-2">
+              <span className="text-[9px] font-mono text-cyan-500/70 tracking-wider uppercase">
+                Target: {selectedTask}
+              </span>
+              <span className={`text-[9px] font-mono uppercase tracking-wider ${agentColor}`}>
+                [{agentLabel}]
+              </span>
             </div>
           )}
 
@@ -136,22 +198,73 @@ export function PromptBar({
           />
         </div>
 
+        {/* Skills button */}
+        {skills.length > 0 && selectedTask && (
+          <div className="relative" ref={skillsRef}>
+            <button
+              onClick={() => setShowSkills(v => !v)}
+              className={`flex items-center gap-1 px-2 h-10 rounded-sm border transition-all duration-200
+                ${showSkills || pendingSkill
+                  ? "border-violet-400/60 bg-violet-500/20 text-violet-300"
+                  : "border-violet-700/40 bg-violet-950/30 text-violet-600 hover:border-violet-500/50 hover:text-violet-400"
+                }`}
+              title="Apply a skill"
+            >
+              <Wand2 size={14} />
+              <span className="text-[10px] font-mono hidden sm:inline">Skills</span>
+              <ChevronDown size={10} className={`transition-transform ${showSkills ? "rotate-180" : ""}`} />
+            </button>
+
+            {showSkills && (
+              <div className="absolute bottom-full right-0 mb-2 w-72 bg-slate-900 border border-violet-500/40 rounded-sm shadow-xl shadow-violet-500/10 z-50 overflow-hidden">
+                <div className="px-3 py-2 bg-slate-800/80 border-b border-violet-600/20">
+                  <span className="text-[10px] font-mono text-violet-300 uppercase tracking-wider">
+                    Apply skill → {agentLabel}
+                  </span>
+                </div>
+                <div className="max-h-64 overflow-y-auto">
+                  {skills.map(skill => (
+                    <button
+                      key={skill.slug}
+                      onClick={() => handleSelectSkill(skill)}
+                      className="w-full text-left px-3 py-2.5 hover:bg-violet-500/10 border-b border-violet-800/20 last:border-0 transition-colors group"
+                    >
+                      <div className="text-xs font-mono text-violet-200 group-hover:text-violet-100">
+                        {skill.name}
+                      </div>
+                      {skill.description && (
+                        <div className="text-[10px] font-mono text-violet-500/70 mt-0.5 line-clamp-2">
+                          {skill.description}
+                        </div>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Send button */}
         <button
           onClick={handleSend}
-          disabled={!message.trim() || !selectedTask}
+          disabled={(!message.trim() && !pendingSkill) || !selectedTask}
           className={`flex items-center justify-center w-10 h-10 rounded-sm
             border transition-all duration-300 group
-            ${message.trim() && selectedTask
-              ? "border-cyan-400/60 bg-cyan-500/20 hover:bg-cyan-500/30 cursor-pointer"
+            ${(message.trim() || pendingSkill) && selectedTask
+              ? pendingSkill
+                ? "border-violet-400/60 bg-violet-500/20 hover:bg-violet-500/30 cursor-pointer"
+                : "border-cyan-400/60 bg-cyan-500/20 hover:bg-cyan-500/30 cursor-pointer"
               : "border-cyan-800/30 bg-slate-950/30 cursor-not-allowed"
             }`}
         >
           <Send
             size={16}
             className={`transition-all duration-300 ${
-              message.trim() && selectedTask
-                ? "text-cyan-300 group-hover:text-cyan-100 group-hover:translate-x-0.5 group-hover:-translate-y-0.5"
+              (message.trim() || pendingSkill) && selectedTask
+                ? pendingSkill
+                  ? "text-violet-300 group-hover:text-violet-100 group-hover:translate-x-0.5 group-hover:-translate-y-0.5"
+                  : "text-cyan-300 group-hover:text-cyan-100 group-hover:translate-x-0.5 group-hover:-translate-y-0.5"
                 : "text-cyan-800"
             }`}
           />

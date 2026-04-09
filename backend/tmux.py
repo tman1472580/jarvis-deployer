@@ -10,6 +10,9 @@ ANSI_RE = re.compile(
     r"\x1b(?:\[[0-9;]*[a-zA-Z]|\][^\x07]*\x07|[()][AB012]|\[\??\d*[hl])"
 )
 
+# All agent CLI names to detect
+AGENT_KEYWORDS = ["claude", "gemini", "codex"]
+
 
 def _run(cmd, timeout=5):
     try:
@@ -37,20 +40,30 @@ def _fmt_tokens(n):
 
 
 # ── Tmux introspection ──────────────────────────────────────────────────
-def _has_claude_descendant(pid, depth=3):
+def _detect_agent_from_proc(pid, depth=3):
+    """Walk the process tree and return which agent keyword is found, or None."""
     if depth <= 0:
-        return False
+        return None
     out = _run(["ps", "-o", "command=", "-p", str(pid)])
-    if "claude" in out.lower():
-        return True
+    for kw in AGENT_KEYWORDS:
+        if kw in out.lower():
+            return kw
     for child in _run(["pgrep", "-P", str(pid)]).split():
         child = child.strip()
-        if child and _has_claude_descendant(child, depth - 1):
-            return True
-    return False
+        if child:
+            found = _detect_agent_from_proc(child, depth - 1)
+            if found:
+                return found
+    return None
+
+
+# Keep backward-compat alias
+def _has_claude_descendant(pid, depth=3):
+    return _detect_agent_from_proc(pid, depth) is not None
 
 
 def get_claude_panes():
+    """Return all panes running any supported agent (Claude, Gemini, Codex)."""
     fmt = "\t".join([
         "#{session_name}", "#{window_index}", "#{pane_index}",
         "#{pane_id}", "#{pane_current_command}", "#{pane_pid}",
@@ -67,9 +80,34 @@ def get_claude_panes():
             pane_id=parts[3], cmd=parts[4], pid=parts[5],
             win_name=parts[6], target=parts[7],
         )
-        if "claude" in p["cmd"].lower() or _has_claude_descendant(p["pid"]):
+        # Detect agent from command name first (fast path)
+        cmd_lower = p["cmd"].lower()
+        agent_kw = next((kw for kw in AGENT_KEYWORDS if kw in cmd_lower), None)
+        # Fallback: walk process tree (handles node-wrapped CLIs like gemini)
+        if not agent_kw:
+            agent_kw = _detect_agent_from_proc(p["pid"])
+        if agent_kw:
+            p["agent_type"] = agent_kw
             panes.append(p)
     return panes
+
+
+def _is_gemini_idle(vis_lines):
+    """Check if the last non-empty visible line is a bare Gemini "> " prompt."""
+    for line in reversed(vis_lines):
+        c = _strip(line).strip()
+        if c:
+            return c == ">" or c.startswith("> ")
+    return False
+
+
+def _is_gemini_waiting(vis_lines):
+    """Check if Gemini is waiting for multi-line input or a follow-up."""
+    for line in reversed(vis_lines[-10:]):
+        c = _strip(line).strip()
+        if c and (c.endswith("?") or "continue" in c.lower() or "enter" in c.lower()):
+            return True
+    return False
 
 
 def read_pane_content(target):
@@ -79,12 +117,14 @@ def read_pane_content(target):
     vis_lines = visible.splitlines()
 
     info = dict(model=None, version=None, status="Idle", activity="",
-                first_user_msg=None, prompt_options=[], prompt_desc="")
+                first_user_msg=None, prompt_options=[], prompt_desc="",
+                agent_type="claude")
 
     for line in all_lines:
         c = _strip(line).strip()
         if not c:
             continue
+        # Claude model detection
         m = re.search(r"(Opus|Sonnet|Haiku)\s+([\d.]+)\s*[·\xb7]", c, re.I)
         if m:
             info["model"] = f"{m.group(1)} {m.group(2)}"
@@ -94,6 +134,18 @@ def read_pane_content(target):
         m = re.search(r"Claude Code\s+(v[\d.]+)", c, re.I)
         if m:
             info["version"] = m.group(1)
+        # Gemini model detection
+        m = re.search(r"(gemini-[\w.-]+)", c, re.I)
+        if m:
+            info["model"] = m.group(1)
+            info["agent_type"] = "gemini"
+        if re.search(r"\bgemini\b", c, re.I) and not info["model"]:
+            info["agent_type"] = "gemini"
+        # Codex model detection
+        m = re.search(r"(codex-[\w.-]+|gpt-[\w.-]+)", c, re.I)
+        if m and info["agent_type"] == "claude":
+            info["model"] = m.group(1)
+            info["agent_type"] = "codex"
 
     for i, line in enumerate(all_lines):
         c = _strip(line).strip()
@@ -120,6 +172,11 @@ def read_pane_content(target):
             info["status"] = "Idle"
         else:
             info["status"] = "Waiting for input"
+    elif _is_gemini_idle(vis_lines):
+        # Gemini CLI uses "> " as its idle prompt
+        info["status"] = "Idle"
+    elif _is_gemini_waiting(vis_lines):
+        info["status"] = "Waiting for input"
     else:
         info["status"] = "Working"
 

@@ -6,7 +6,7 @@ import { HudHeader } from "@/components/jarvis/hud-header"
 import { TaskFolder } from "@/components/jarvis/task-folder"
 import { PromptBar } from "@/components/jarvis/prompt-bar"
 import { useEelState } from "@/hooks/use-eel"
-import { eel, type PaneData } from "@/lib/eel-bridge"
+import { eel, type PaneData, type SkillDef } from "@/lib/eel-bridge"
 
 const BUILD_VERSION = "v4-eel-2026-03-21"
 
@@ -23,6 +23,7 @@ export interface TaskData {
   target: string
   pane_id: string
   model: string
+  agent_type: "claude" | "gemini" | "codex"
   contextUsed: number
   contextTotal: number
   turns: number
@@ -63,6 +64,7 @@ function panesToTasks(panes: PaneData[]): TaskData[] {
     target: p.target,
     pane_id: p.pane_id,
     model: p.model || "Unknown",
+    agent_type: p.agent_type || "claude",
     contextUsed: p.input_tokens / 1000,
     contextTotal: p.context_window / 1000,
     turns: p.turns,
@@ -120,6 +122,7 @@ export default function AICommandCenter() {
   const { panes, usageStats, connected, refresh } = useEelState()
   const [tasks, setTasks] = useState<TaskData[]>([])
   const [folderStacks, setFolderStacks] = useState<FolderStack[]>([])
+  const [skills, setSkills] = useState<SkillDef[]>([])
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
   const [zIndices, setZIndices] = useState<number[]>([])
   const [maxZ, setMaxZ] = useState(0)
@@ -129,6 +132,11 @@ export default function AICommandCenter() {
   const [mountKey] = useState(() => `${BUILD_VERSION}-${Date.now()}`)
   const prevFolderStacksRef = useRef<FolderStack[]>([])
   const [hiddenFolderIds, setHiddenFolderIds] = useState<Set<string>>(new Set())
+
+  // Load skills once on mount
+  useEffect(() => {
+    eel.getSkills().then(setSkills)
+  }, [])
 
   // Update tasks and folder stacks when panes change
   useEffect(() => {
@@ -178,6 +186,12 @@ export default function AICommandCenter() {
     setTimeout(refresh, 800)
   }, [selectedTask, refresh])
 
+  const handleRunSkill = useCallback(async (skillSlug: string, userPrompt: string) => {
+    if (!selectedTask) return
+    await eel.runSkill(selectedTask.target, skillSlug, userPrompt)
+    setTimeout(refresh, 800)
+  }, [selectedTask, refresh])
+
   const handleSelectTask = useCallback(async (taskId: string | null) => {
     setSelectedTaskId(taskId)
     if (taskId) {
@@ -196,9 +210,9 @@ export default function AICommandCenter() {
     setSlashDialogResult({ cmd, result })
   }, [])
 
-  const handleAddTask = useCallback(async (agentCmd: string, agentLabel: string) => {
+  const handleAddTask = useCallback(async (agentCmd: string, agentLabel: string, cwd?: string) => {
     const name = `${agentLabel.replace(/\s+/g, "-")}-${Date.now().toString(36).slice(-4)}`
-    await eel.launchNewSession(agentCmd, name)
+    await eel.launchNewSession(agentCmd, name, cwd)
     setTimeout(refresh, 1500)
   }, [refresh])
 
@@ -586,12 +600,15 @@ export default function AICommandCenter() {
         <footer className="sticky bottom-0 z-50 p-6 pt-0 bg-gradient-to-t from-slate-950 via-slate-950/95 to-transparent">
           <PromptBar
             selectedTask={selectedTask ? selectedTask.target : null}
+            agentType={selectedTask?.agent_type ?? "claude"}
             onSend={handleSendPrompt}
             promptOptions={selectedTask?.prompt_options}
             promptDesc={selectedTask?.prompt_desc}
             taskStatus={selectedTask?.status}
             onSendOption={handleSendOption}
             onSendEscape={handleSendEscape}
+            skills={skills}
+            onRunSkill={handleRunSkill}
           />
         </footer>
       </div>

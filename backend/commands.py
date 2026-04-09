@@ -2,6 +2,8 @@
 Slash commands, send keys, attach, pane management, session launching.
 """
 
+import os
+import pathlib
 import re
 import subprocess
 import time
@@ -215,23 +217,88 @@ def swap_pane(target, direction):
 
 
 # ── Session launching ────────────────────────────────────────────────────
-def new_session(cmd, name):
+def new_session(cmd, name, cwd=None):
     """Create a brand new tmux session running the given agent."""
     name = re.sub(r"[^a-zA-Z0-9_-]", "-", name)
-    _run(["tmux", "new-session", "-d", "-s", name, cmd])
+    args = ["tmux", "new-session", "-d", "-s", name]
+    if cwd:
+        args += ["-c", cwd]
+    args.append(cmd)
+    _run(args)
 
 
-def new_window(cmd, session):
+def new_window(cmd, session, cwd=None):
     """Create a new tmux window in the given session with the agent."""
-    _run(["tmux", "new-window", "-t", session, cmd])
+    args = ["tmux", "new-window", "-t", session]
+    if cwd:
+        args += ["-c", cwd]
+    args.append(cmd)
+    _run(args)
 
 
-def split_window(cmd, session, window=None):
+def split_window(cmd, session, window=None, cwd=None):
     """Split a pane in the given session (optionally specific window)."""
     target = f"{session}:{window}" if window else session
-    _run(["tmux", "split-window", "-t", target, cmd])
+    args = ["tmux", "split-window", "-t", target]
+    if cwd:
+        args += ["-c", cwd]
+    args.append(cmd)
+    _run(args)
 
 
 def kill_session(session):
     """Kill an entire tmux session."""
     _run(["tmux", "kill-session", "-t", session])
+
+
+# ── Skills ───────────────────────────────────────────────────────────────
+SKILLS_DIR = pathlib.Path.home() / ".claude" / "skills"
+
+
+def _parse_skill_md(path: pathlib.Path):
+    """Parse a SKILL.md file and return name, description, body."""
+    content = path.read_text(encoding="utf-8")
+    name = path.parent.name
+    description = ""
+    body = content
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            for line in parts[1].splitlines():
+                if line.startswith("name:"):
+                    name = line.split(":", 1)[1].strip()
+                elif line.startswith("description:"):
+                    description = line.split(":", 1)[1].strip()
+            body = parts[2].strip()
+    return {"name": name, "slug": path.parent.name, "description": description, "body": body}
+
+
+def get_skills():
+    """Return all available skills from ~/.claude/skills/"""
+    if not SKILLS_DIR.exists():
+        return []
+    skills = []
+    for skill_dir in sorted(SKILLS_DIR.iterdir()):
+        skill_file = skill_dir / "SKILL.md"
+        if skill_file.exists():
+            try:
+                skills.append(_parse_skill_md(skill_file))
+            except Exception:
+                continue
+    return skills
+
+
+def run_skill(target, skill_slug, user_prompt=""):
+    """Send a skill's instructions + optional user request to any agent pane."""
+    skill_file = SKILLS_DIR / skill_slug / "SKILL.md"
+    if not skill_file.exists():
+        if user_prompt:
+            send_keys(target, user_prompt, enter=True)
+        return
+    parsed = _parse_skill_md(skill_file)
+    body = parsed["body"]
+    if user_prompt:
+        message = f"{body}\n\n---\nUser request: {user_prompt}"
+    else:
+        message = body
+    send_keys(target, message, enter=True)

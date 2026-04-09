@@ -4,6 +4,7 @@ Eel-based web UI for Claude Code Tmux Monitor.
 Serves the Next.js static export and exposes Python backend functions.
 """
 
+import subprocess
 import threading
 import time
 from collections import OrderedDict
@@ -21,6 +22,7 @@ from backend.commands import (
     AGENTS, SLASH_COMMANDS, send_keys, attach, select_pane,
     _run_slash_command, move_pane_to, break_pane, swap_pane,
     new_session, new_window, split_window, kill_session,
+    get_skills, run_skill,
 )
 
 # ── Initialize Eel ──────────────────────────────────────────────────────
@@ -68,6 +70,7 @@ def get_full_state():
                     "pane_id": p["pane_id"],
                     "target": p["target"],
                     "model": model_str,
+                    "agent_type": p.get("agent_type") or pane_info.get("agent_type", "claude"),
                     "input_tokens": input_tok,
                     "context_pct": ctx_pct,
                     "context_window": CONTEXT_WINDOW,
@@ -128,21 +131,21 @@ def run_send_escape(target):
 
 
 @eel.expose
-def launch_new_session(cmd, name):
+def launch_new_session(cmd, name, cwd=None):
     """Create a new tmux session."""
-    new_session(cmd, name)
+    new_session(cmd, name, cwd)
 
 
 @eel.expose
-def launch_new_window(cmd, session):
+def launch_new_window(cmd, session, cwd=None):
     """Create a new window in a session."""
-    new_window(cmd, session)
+    new_window(cmd, session, cwd)
 
 
 @eel.expose
-def launch_split(cmd, session, window=None):
+def launch_split(cmd, session, window=None, cwd=None):
     """Split a pane in a session."""
-    split_window(cmd, session, window)
+    split_window(cmd, session, window, cwd)
 
 
 @eel.expose
@@ -192,6 +195,18 @@ def get_slash_commands():
     return SLASH_COMMANDS
 
 
+@eel.expose
+def get_available_skills():
+    """Return all available skills from ~/.claude/skills/"""
+    return get_skills()
+
+
+@eel.expose
+def run_agent_skill(target, skill_slug, user_prompt=""):
+    """Send a skill's instructions to any agent pane (Claude, Gemini, Codex)."""
+    run_skill(target, skill_slug, user_prompt)
+
+
 # ── Background usage poller ──────────────────────────────────────────────
 
 def _usage_poller():
@@ -212,8 +227,13 @@ def _usage_poller():
 
 def main():
     if not _run(["tmux", "list-sessions"]):
-        print("No tmux server running. Start tmux first, then run this again.")
-        return
+        # No tmux server running — start one automatically
+        subprocess.Popen(["tmux", "new-session", "-d", "-s", "main"])
+        import time
+        time.sleep(0.5)
+        if not _run(["tmux", "list-sessions"]):
+            print("Failed to start tmux. Please start it manually.")
+            return
 
     # Start background usage poller
     poller = threading.Thread(target=_usage_poller, daemon=True)

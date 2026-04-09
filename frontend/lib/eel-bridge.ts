@@ -17,6 +17,7 @@ export interface PaneData {
   pane_id: string
   target: string
   model: string
+  agent_type: "claude" | "gemini" | "codex"
   input_tokens: number
   context_pct: number
   context_window: number
@@ -26,6 +27,13 @@ export interface PaneData {
   prompt_options: [string, string][]  // [num, label]
   prompt_desc: string
   first_user_msg: string
+}
+
+export interface SkillDef {
+  name: string
+  slug: string
+  description: string
+  body: string
 }
 
 export interface UsageStats {
@@ -121,14 +129,14 @@ export const eel = {
   sendEscape: (target: string) =>
     callEel(() => window.eel.run_send_escape(target), undefined),
 
-  launchNewSession: (cmd: string, name: string) =>
-    callEel(() => window.eel.launch_new_session(cmd, name), undefined),
+  launchNewSession: (cmd: string, name: string, cwd?: string) =>
+    callEel(() => window.eel.launch_new_session(cmd, name, cwd || null), undefined),
 
-  launchNewWindow: (cmd: string, session: string) =>
-    callEel(() => window.eel.launch_new_window(cmd, session), undefined),
+  launchNewWindow: (cmd: string, session: string, cwd?: string) =>
+    callEel(() => window.eel.launch_new_window(cmd, session, cwd || null), undefined),
 
-  launchSplit: (cmd: string, session: string, win?: string) =>
-    callEel(() => window.eel.launch_split(cmd, session, win), undefined),
+  launchSplit: (cmd: string, session: string, win?: string, cwd?: string) =>
+    callEel(() => window.eel.launch_split(cmd, session, win || null, cwd || null), undefined),
 
   movePane: (paneId: string, target: string) =>
     callEel(() => window.eel.run_move_pane(paneId, target), undefined),
@@ -147,4 +155,10 @@ export const eel = {
 
   getSlashCommands: () =>
     callEel<string[]>(() => window.eel.get_slash_commands(), []),
+
+  getSkills: () =>
+    callEel<SkillDef[]>(() => window.eel.get_available_skills(), []),
+
+  runSkill: (target: string, skillSlug: string, userPrompt = "") =>
+    callEel(() => window.eel.run_agent_skill(target, skillSlug, userPrompt), undefined),
 }

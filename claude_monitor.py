@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 import glob
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -34,6 +35,9 @@ REFRESH_MS = 3000
 CONTEXT_WINDOW = 200_000
 CLAUDE_DIR = os.path.expanduser("~/.claude")
 PROJECTS_DIR = os.path.join(CLAUDE_DIR, "projects")
+
+# All agent CLI names to detect
+AGENT_KEYWORDS = ["claude", "gemini", "codex"]
 
 # ── Theme ────────────────────────────────────────────────────────────────
 BG = "#0d1117"
@@ -97,6 +101,7 @@ def _parse_session_jsonl(path):
     last_usage = None
     model = None
     first_user_text = None
+    user_messages = []
     total_output = 0
     num_turns = 0
 
@@ -107,8 +112,12 @@ def _parse_session_jsonl(path):
             except json.JSONDecodeError:
                 continue
             msg = d.get("message", {})
-            if first_user_text is None and d.get("type") == "user":
-                first_user_text = _extract_text(msg)
+            if d.get("type") == "user":
+                t = _extract_text(msg)
+                if t and not t.startswith("/"):
+                    if first_user_text is None:
+                        first_user_text = t
+                    user_messages.append(t)
             if isinstance(msg, dict) and "usage" in msg:
                 last_usage = msg["usage"]
                 model = msg.get("model", model)
@@ -118,6 +127,7 @@ def _parse_session_jsonl(path):
     if not last_usage:
         return dict(model=model, input_tokens=0, output_tokens=0,
                     ctx_pct=0, first_user_msg=first_user_text or "",
+                    user_messages=user_messages,
                     total_output=0, num_turns=0)
 
     inp = last_usage.get("input_tokens", 0)
@@ -130,28 +140,35 @@ def _parse_session_jsonl(path):
         output_tokens=last_usage.get("output_tokens", 0),
         ctx_pct=round(total_ctx / CONTEXT_WINDOW * 100, 1) if CONTEXT_WINDOW else 0,
         first_user_msg=first_user_text or "",
+        user_messages=user_messages,
         total_output=total_output, num_turns=num_turns,
     )
 
 
 def _extract_text(msg):
+    raw = ""
     if isinstance(msg, str):
-        return msg
-    if isinstance(msg, dict):
+        raw = msg
+    elif isinstance(msg, dict):
         content = msg.get("content", "")
         if isinstance(content, str):
-            return content
-        if isinstance(content, list):
+            raw = content
+        elif isinstance(content, list):
             for c in content:
                 if isinstance(c, dict) and c.get("type") == "text":
-                    return c.get("text", "")
-    return ""
+                    raw = c.get("text", "")
+                    break
+    # Strip XML tags (e.g. <local-command-caveat>...</local-command-caveat>)
+    cleaned = re.sub(r"<[^>]+>", "", raw).strip()
+    # Skip system caveats that aren't real user messages
+    if cleaned.startswith("Caveat:") or not cleaned:
+        return ""
+    return cleaned
 
 
 # ── Usage stats ────────────────────────────────────────────────────────
 STATS_CACHE = os.path.join(CLAUDE_DIR, "stats-cache.json")
 RATE_LIMITS_FILE = os.path.join(CLAUDE_DIR, "rate-limits.json")
-USAGE_POLL_MS = 60_000  # poll /usage every 60 seconds
 
 
 def _load_usage_stats():
@@ -242,48 +259,28 @@ def _load_usage_stats():
     return stats
 
 
-def _scrape_usage(target):
-    """Send /usage to a Claude pane, scrape the output, then close it."""
-    _run(["tmux", "send-keys", "-t", target, "-l", "/usage"])
-    _run(["tmux", "send-keys", "-t", target, "Enter"])
-    time.sleep(4)
-
-    # Capture full scrollback (TUI renders above visible area)
-    content = _run(["tmux", "capture-pane", "-t", target, "-p", "-S", "-", "-E", "-"])
-
-    # Close the /usage screen
-    _run(["tmux", "send-keys", "-t", target, "Escape"])
-
-    # Parse
+def _read_rate_limits():
+    """Read rate limits from ~/.claude/rate-limits.json (written by Claude Code)."""
     result = {"five_h_pct": None, "five_h_resets": None,
               "seven_d_pct": None, "seven_d_resets": None}
-    lines = [_strip(l).strip() for l in content.splitlines()]
-
-    # Find the /usage output section (look for "Current session" and "Current week")
-    section = None
-    for line in lines:
-        low = line.lower()
-        if "current session" in low:
-            section = "5h"
-            continue
-        elif "current week" in low:
-            section = "7d"
-            continue
-        m = re.search(r'(\d+)%\s*used', line)
-        if m and section:
-            pct = int(m.group(1))
-            if section == "5h":
-                result["five_h_pct"] = pct
-            elif section == "7d":
-                result["seven_d_pct"] = pct
-        if low.startswith("resets") and section:
-            if section == "5h":
-                result["five_h_resets"] = line
-                section = None
-            elif section == "7d":
-                result["seven_d_resets"] = line
-                section = None
-
+    try:
+        with open(RATE_LIMITS_FILE) as f:
+            data = json.load(f)
+        rl = data.get("rate_limits", {})
+        fh = rl.get("five_hour", {})
+        sd = rl.get("seven_day", {})
+        if "used_percentage" in fh:
+            result["five_h_pct"] = fh["used_percentage"]
+        if "resets_at" in fh:
+            reset_dt = datetime.fromtimestamp(fh["resets_at"])
+            result["five_h_resets"] = f"Resets {reset_dt.strftime('%I:%M %p')}"
+        if "used_percentage" in sd:
+            result["seven_d_pct"] = sd["used_percentage"]
+        if "resets_at" in sd:
+            reset_dt = datetime.fromtimestamp(sd["resets_at"])
+            result["seven_d_resets"] = f"Resets {reset_dt.strftime('%a %I:%M %p')}"
+    except Exception:
+        pass
     return result
 
 
@@ -347,20 +344,30 @@ def _run_slash_command(target, command):
 
 
 # ── Tmux introspection ──────────────────────────────────────────────────
-def _has_claude_descendant(pid, depth=3):
+def _detect_agent_from_proc(pid, depth=3):
+    """Walk the process tree and return which agent keyword is found, or None."""
     if depth <= 0:
-        return False
+        return None
     out = _run(["ps", "-o", "command=", "-p", str(pid)])
-    if "claude" in out.lower():
-        return True
+    for kw in AGENT_KEYWORDS:
+        if kw in out.lower():
+            return kw
     for child in _run(["pgrep", "-P", str(pid)]).split():
         child = child.strip()
-        if child and _has_claude_descendant(child, depth - 1):
-            return True
-    return False
+        if child:
+            found = _detect_agent_from_proc(child, depth - 1)
+            if found:
+                return found
+    return None
+
+
+# Keep backward-compat alias
+def _has_claude_descendant(pid, depth=3):
+    return _detect_agent_from_proc(pid, depth) is not None
 
 
 def get_claude_panes():
+    """Return all panes running any supported agent (Claude, Gemini, Codex)."""
     fmt = "\t".join([
         "#{session_name}", "#{window_index}", "#{pane_index}",
         "#{pane_id}", "#{pane_current_command}", "#{pane_pid}",
@@ -377,9 +384,32 @@ def get_claude_panes():
             pane_id=parts[3], cmd=parts[4], pid=parts[5],
             win_name=parts[6], target=parts[7],
         )
-        if "claude" in p["cmd"].lower() or _has_claude_descendant(p["pid"]):
+        cmd_lower = p["cmd"].lower()
+        agent_kw = next((kw for kw in AGENT_KEYWORDS if kw in cmd_lower), None)
+        if not agent_kw:
+            agent_kw = _detect_agent_from_proc(p["pid"])
+        if agent_kw:
+            p["agent_type"] = agent_kw
             panes.append(p)
     return panes
+
+
+def _is_gemini_idle(vis_lines):
+    """Check if the last non-empty visible line is a bare Gemini '>' prompt."""
+    for line in reversed(vis_lines):
+        c = _strip(line).strip()
+        if c:
+            return c == ">" or c.startswith("> ")
+    return False
+
+
+def _is_gemini_waiting(vis_lines):
+    """Check if Gemini is waiting for follow-up input."""
+    for line in reversed(vis_lines[-10:]):
+        c = _strip(line).strip()
+        if c and (c.endswith("?") or "continue" in c.lower() or "enter" in c.lower()):
+            return True
+    return False
 
 
 def read_pane_content(target):
@@ -389,27 +419,41 @@ def read_pane_content(target):
     vis_lines = visible.splitlines()
 
     info = dict(model=None, version=None, status="Idle", activity="",
-                first_user_msg=None, prompt_options=[], prompt_desc="")
+                first_user_msg=None, prompt_options=[], prompt_desc="",
+                agent_type="claude")
 
     for line in all_lines:
         c = _strip(line).strip()
         if not c:
             continue
-        m = re.search(r"(Opus|Sonnet|Haiku)\s+([\d.]+)\s*[·\xb7]", c, re.I)
+        # Claude model detection
+        m = re.search(r"(Opus|Sonnet|Haiku)\s+([\d.]+)", c, re.I)
         if m:
             info["model"] = f"{m.group(1)} {m.group(2)}"
-        m = re.search(r"(claude-[\w.-]+)", c, re.I)
+        m = re.search(r"(claude-(?:opus|sonnet|haiku)[\w.-]*)", c, re.I)
         if m and not info["model"]:
             info["model"] = m.group(1)
         m = re.search(r"Claude Code\s+(v[\d.]+)", c, re.I)
         if m:
             info["version"] = m.group(1)
+        # Gemini model detection
+        m = re.search(r"(gemini-[\w.-]+)", c, re.I)
+        if m:
+            info["model"] = m.group(1)
+            info["agent_type"] = "gemini"
+        if re.search(r"\bgemini\b", c, re.I) and not info["model"]:
+            info["agent_type"] = "gemini"
+        # Codex model detection
+        m = re.search(r"(codex-[\w.-]+|gpt-[\w.-]+)", c, re.I)
+        if m and info["agent_type"] == "claude":
+            info["model"] = m.group(1)
+            info["agent_type"] = "codex"
 
     for i, line in enumerate(all_lines):
         c = _strip(line).strip()
         if c.startswith("\u276f") or c.startswith("❯"):
             msg_part = c.lstrip("\u276f❯ ").strip()
-            if msg_part and len(msg_part) > 2:
+            if msg_part and len(msg_part) > 2 and not msg_part.startswith("/"):
                 info["first_user_msg"] = msg_part
                 break
 
@@ -430,6 +474,10 @@ def read_pane_content(target):
             info["status"] = "Idle"
         else:
             info["status"] = "Waiting for input"
+    elif _is_gemini_idle(vis_lines):
+        info["status"] = "Idle"
+    elif _is_gemini_waiting(vis_lines):
+        info["status"] = "Waiting for input"
     else:
         info["status"] = "Working"
 
@@ -441,11 +489,14 @@ def read_pane_content(target):
         "check", "deploy", "start", "finish", "download", "upload",
         "searched", "scanning", "processing",
     }
+    statusbar_hints = {"Auto-update", "claude doctor", "npm i -g"}
     skip = {"? for shortcuts", "❯", "\u276f", "for shortcuts",
             "Esc to cancel", "Tab to amend"}
     for line in reversed(vis_lines[-40:]):
         c = _strip(line).strip()
         if len(c) < 4 or any(c.startswith(s) for s in skip):
+            continue
+        if any(h in c for h in statusbar_hints):
             continue
         if any(k in c.lower() for k in action_stems):
             info["activity"] = c[:120]
@@ -456,7 +507,8 @@ def read_pane_content(target):
         for line in reversed(vis_lines):
             c = _strip(line).strip()
             if (c and len(c) > 3 and not any(c.startswith(s) for s in skip)
-                    and not set(c) <= box_chars):
+                    and not set(c) <= box_chars
+                    and not any(h in c for h in statusbar_hints)):
                 info["activity"] = c[:120]
                 break
 
@@ -502,17 +554,23 @@ def match_pane_to_session(pane_info, sessions):
     pane_msg_lower = pane_msg.lower().strip()
     best_sid, best_score = None, 0
     for sid, sdata in sessions.items():
-        s_msg = sdata.get("first_user_msg", "").lower().strip()
-        if not s_msg:
-            continue
-        if pane_msg_lower in s_msg or s_msg.startswith(pane_msg_lower[:30]):
-            score = len(pane_msg_lower)
-        elif s_msg in pane_msg_lower:
-            score = len(s_msg)
-        else:
-            continue
-        if score > best_score:
-            best_score, best_sid = score, sid
+        # Check all user messages in the session, not just the first
+        msgs = sdata.get("user_messages", [])
+        if not msgs:
+            s = sdata.get("first_user_msg", "")
+            msgs = [s] if s else []
+        for s_msg_raw in msgs:
+            s_msg = s_msg_raw.lower().strip()
+            if not s_msg:
+                continue
+            if pane_msg_lower in s_msg or s_msg.startswith(pane_msg_lower[:30]):
+                score = len(pane_msg_lower)
+            elif s_msg in pane_msg_lower:
+                score = len(s_msg)
+            else:
+                continue
+            if score > best_score:
+                best_score, best_sid = score, sid
     return best_sid
 
 
@@ -612,6 +670,54 @@ AGENTS = [
     ("Gemini CLI", "gemini"),
     ("Codex CLI", "codex"),
 ]
+
+SKILLS_DIR = pathlib.Path.home() / ".claude" / "skills"
+
+
+def _parse_skill_md(path):
+    content = path.read_text(encoding="utf-8")
+    name = path.parent.name
+    description = ""
+    body = content
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            for line in parts[1].splitlines():
+                if line.startswith("name:"):
+                    name = line.split(":", 1)[1].strip()
+                elif line.startswith("description:"):
+                    description = line.split(":", 1)[1].strip()
+            body = parts[2].strip()
+    return {"name": name, "slug": path.parent.name, "description": description, "body": body}
+
+
+def get_skills():
+    """Return all available skills from ~/.claude/skills/"""
+    if not SKILLS_DIR.exists():
+        return []
+    skills = []
+    for skill_dir in sorted(SKILLS_DIR.iterdir()):
+        skill_file = skill_dir / "SKILL.md"
+        if skill_file.exists():
+            try:
+                skills.append(_parse_skill_md(skill_file))
+            except Exception:
+                continue
+    return skills
+
+
+def run_skill(target, skill_slug, user_prompt=""):
+    """Send a skill's instructions + optional user request to any agent pane."""
+    skill_file = SKILLS_DIR / skill_slug / "SKILL.md"
+    if not skill_file.exists():
+        if user_prompt:
+            send_keys(target, user_prompt, enter=True)
+        return
+    parsed = _parse_skill_md(skill_file)
+    body = parsed["body"]
+    message = f"{body}\n\n---\nUser request: {user_prompt}" if user_prompt else body
+    send_keys(target, message, enter=True)
+
 
 SLASH_COMMANDS = [
     # Session & Conversation
@@ -715,6 +821,17 @@ class Monitor:
             font=("Menlo", 13, "bold"), bd=0, padx=12, pady=4,
             command=self._show_slash_menu)
         self._slash_btn.pack(side="right", padx=(0, 8))
+
+        # Skills button
+        self._skills_menu = tk.Menu(self.root, tearoff=0, bg=SURFACE, fg=FG,
+                                     activebackground=SEL_BG, activeforeground="#fff",
+                                     font=("Menlo", 12))
+        self._skills_btn = tk.Button(
+            hdr, text="✦ Skills", bg="#4a1d7a", fg="#c084fc",
+            activebackground="#6b21a8", activeforeground="#e9d5ff",
+            font=("Menlo", 13, "bold"), bd=0, padx=12, pady=4,
+            command=self._show_skills_menu)
+        self._skills_btn.pack(side="right", padx=(0, 8))
 
     def _build_usage_panel(self):
         panel = tk.Frame(self.root, bg=SURFACE, highlightbackground=BORDER,
@@ -1066,9 +1183,11 @@ class Monitor:
 
     def _launch_new_session(self, cmd, label):
         """Create a brand new tmux session running the given agent."""
+        from tkinter import filedialog
+
         dialog = tk.Toplevel(self.root)
         dialog.title(f"New Session — {label}")
-        dialog.geometry("400x130")
+        dialog.geometry("500x200")
         dialog.configure(bg=SURFACE)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -1081,13 +1200,34 @@ class Monitor:
         entry.pack(fill="x", padx=16)
         entry.focus_set()
 
+        tk.Label(dialog, text="Working directory:", bg=SURFACE, fg=FG,
+                 font=("Menlo", 12)).pack(pady=(10, 4), padx=16, anchor="w")
+        dir_frame = tk.Frame(dialog, bg=SURFACE)
+        dir_frame.pack(fill="x", padx=16)
+        dir_var = tk.StringVar(value=os.path.expanduser("~"))
+        dir_entry = tk.Entry(dir_frame, textvariable=dir_var, bg=BG, fg=FG,
+                             insertbackground=ACCENT, font=("Menlo", 13), bd=0,
+                             highlightbackground=BORDER, highlightcolor=ACCENT,
+                             highlightthickness=1)
+        dir_entry.pack(side="left", fill="x", expand=True)
+
+        def _browse():
+            d = filedialog.askdirectory(initialdir=dir_var.get(),
+                                        parent=dialog)
+            if d:
+                dir_var.set(d)
+        tk.Button(dir_frame, text="Browse", bg=ACCENT, fg="#000",
+                  font=("Menlo", 11), bd=0, padx=8, pady=2,
+                  command=_browse).pack(side="right", padx=(6, 0))
+
         def _create(_event=None):
             name = entry.get().strip()
             if not name:
                 return
             name = re.sub(r"[^a-zA-Z0-9_-]", "-", name)
+            cwd = dir_var.get().strip() or os.path.expanduser("~")
             dialog.destroy()
-            _run(["tmux", "new-session", "-d", "-s", name, cmd])
+            _run(["tmux", "new-session", "-d", "-s", name, "-c", cwd, cmd])
             self.root.after(1500, self._refresh)
 
         entry.bind("<Return>", _create)
@@ -1163,6 +1303,79 @@ class Monitor:
 
         t = threading.Thread(target=_do, daemon=True)
         t.start()
+
+    # ── Skills ──
+    def _show_skills_menu(self):
+        sel = self.tv.selection()
+        if not sel:
+            self._interact_label.config(
+                text="Select a pane first to apply a skill", fg=YELLOW)
+            return
+        target = self._resolve_target(sel[0])
+        if not target:
+            self._interact_label.config(
+                text="Select a pane first to apply a skill", fg=YELLOW)
+            return
+        skills = get_skills()
+        self._skills_menu.delete(0, tk.END)
+        if not skills:
+            self._skills_menu.add_command(label="  No skills found in ~/.claude/skills/",
+                                           state="disabled")
+        else:
+            for skill in skills:
+                self._skills_menu.add_command(
+                    label=f"  {skill['name']}",
+                    command=lambda s=skill, t=target: self._exec_skill(t, s))
+        self.root.update_idletasks()
+        x = self._skills_btn.winfo_rootx()
+        y = self._skills_btn.winfo_rooty() + self._skills_btn.winfo_height()
+        try:
+            self._skills_menu.tk_popup(x, y, 0)
+        finally:
+            self._skills_menu.grab_release()
+
+    def _exec_skill(self, target, skill):
+        """Show a dialog to enter a user request, then send skill to pane."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Skill: {skill['name']}")
+        dialog.geometry("520x220")
+        dialog.configure(bg=SURFACE)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(dialog, text=f"✦  {skill['name']}", bg=SURFACE, fg="#c084fc",
+                 font=("Menlo", 14, "bold")).pack(pady=(14, 4), padx=16, anchor="w")
+        if skill.get("description"):
+            tk.Label(dialog, text=skill["description"][:120], bg=SURFACE, fg=DIM,
+                     font=("Menlo", 10), wraplength=460, justify="left"
+                     ).pack(padx=16, anchor="w")
+
+        tk.Label(dialog, text="Your request (optional):", bg=SURFACE, fg=FG,
+                 font=("Menlo", 11)).pack(pady=(10, 4), padx=16, anchor="w")
+        entry = tk.Entry(dialog, bg=BG, fg=FG, insertbackground=ACCENT,
+                         font=("Menlo", 12), bd=0, highlightbackground=BORDER,
+                         highlightcolor=ACCENT, highlightthickness=1)
+        entry.pack(fill="x", padx=16)
+        entry.focus_set()
+
+        def _send(_event=None):
+            user_prompt = entry.get().strip()
+            dialog.destroy()
+            run_skill(target, skill["slug"], user_prompt)
+            self._interact_label.config(
+                text=f"Skill '{skill['name']}' sent to {target}", fg="#c084fc")
+            self.root.after(800, self._refresh)
+
+        entry.bind("<Return>", _send)
+        btn_frame = tk.Frame(dialog, bg=SURFACE)
+        btn_frame.pack(fill="x", padx=16, pady=(10, 14))
+        tk.Button(btn_frame, text="Cancel", bg=BORDER, fg=FG,
+                  font=("Menlo", 11), bd=0, padx=12, pady=3,
+                  command=dialog.destroy).pack(side="right")
+        tk.Button(btn_frame, text="Send Skill", bg="#4a1d7a", fg="#e9d5ff",
+                  activebackground="#6b21a8", activeforeground="#f3e8ff",
+                  font=("Menlo", 11, "bold"), bd=0, padx=12, pady=3,
+                  command=_send).pack(side="right", padx=(0, 8))
 
     def _show_result_popup(self, command, target, result):
         self._interact_label.config(text=f"{command} completed", fg=GREEN)
@@ -1244,6 +1457,16 @@ class Monitor:
                 command=lambda c=cmd, t=target: self._exec_slash_command(t, c))
         ctx.add_cascade(label="  / Commands", menu=slash_sub)
 
+        # Skills submenu
+        skills = get_skills()
+        if skills:
+            skills_sub = tk.Menu(ctx, **menu_style)
+            for skill in skills:
+                skills_sub.add_command(
+                    label=f"  {skill['name']}",
+                    command=lambda s=skill, t=target: self._exec_skill(t, s))
+            ctx.add_cascade(label="  ✦ Skills", menu=skills_sub)
+
         ctx.tk_popup(event.x_root, event.y_root)
 
     def _move_pane_to(self, pdata, target_wkey):
@@ -1286,27 +1509,15 @@ class Monitor:
         self._refresh()
 
     def _poll_usage(self):
-        """Scrape /usage from an idle Claude pane every 60s (in background)."""
-        import threading
-
-        def _do_poll():
-            # Find an idle pane
-            panes = get_claude_panes()
-            for p in panes:
-                info = read_pane_content(p["target"])
-                if info["status"] in ("Idle", "Waiting for input"):
-                    result = _scrape_usage(p["target"])
-                    if result.get("five_h_pct") is not None:
-                        self._cached_usage = result
-                    break
-
-        t = threading.Thread(target=_do_poll, daemon=True)
-        t.start()
-        self.root.after(USAGE_POLL_MS, self._poll_usage)
+        """Read rate limits from ~/.claude/rate-limits.json every refresh."""
+        result = _read_rate_limits()
+        if result.get("five_h_pct") is not None:
+            self._cached_usage = result
 
     def _refresh(self):
         now = time.strftime("%H:%M:%S")
         self.lbl_updated.config(text=f"Last updated: {now}")
+        self._poll_usage()
         self._update_usage_panel()
 
         prev_sel = None
@@ -1376,7 +1587,14 @@ class Monitor:
                         ctx_str = f"{_bar(0)} 0/{_fmt_tokens(CONTEXT_WINDOW)} (0%)"
                         tag = "ctx_green"
 
-                    model_str = pane_info.get("model") or sdata.get("model") or "\u2014"
+                    raw_model = pane_info.get("model") or sdata.get("model") or ""
+                    agent_t = p.get("agent_type") or pane_info.get("agent_type", "claude")
+                    if raw_model:
+                        model_str = raw_model
+                    elif agent_t != "claude":
+                        model_str = f"[{agent_t}]"
+                    else:
+                        model_str = "\u2014"
                     turns = str(sdata.get("num_turns", 0))
                     status = pane_info["status"]
                     status_icons = {
@@ -1418,8 +1636,11 @@ class Monitor:
 # ── Entry point ──────────────────────────────────────────────────────────
 def main():
     if not _run(["tmux", "list-sessions"]):
-        print("No tmux server running. Start tmux first, then run this again.")
-        sys.exit(1)
+        subprocess.Popen(["tmux", "new-session", "-d", "-s", "main"])
+        time.sleep(0.5)
+        if not _run(["tmux", "list-sessions"]):
+            print("Failed to start tmux. Please start it manually.")
+            sys.exit(1)
     root = tk.Tk()
     Monitor(root)
     root.mainloop()

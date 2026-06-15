@@ -10,6 +10,10 @@ Real-time web dashboard for monitoring and controlling Claude Code sessions runn
 
 > **Table view.** The same session set rendered as a dense dashboard — task name, pane, model, context window, turns, status, and the latest activity line for every Claude Code session running on your machine. Double-click any row to attach to that exact tmux pane in your terminal.
 
+![Underlying tmux sessions](screenshots/tmux-sessions.png)
+
+> **Underneath.** The actual tmux panes the dashboard is reading from — real Claude Code conversations, mid-turn. Jarvis Deployer scrapes each pane's content to detect status (idle, working, needs approval, waiting for input) and surfaces it as live state in the views above.
+
 ## How It Works
 
 The app has three layers:

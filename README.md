@@ -1,6 +1,14 @@
 # Jarvis Deployer
 
-Real-time web dashboard for monitoring and controlling Claude Code sessions running in tmux.
+Real-time web dashboard for monitoring and controlling Claude Code sessions running in tmux. Every tmux pane running Claude becomes a live card in the browser — you see status, context-window usage, and rate-limit bars at a glance, and you can send prompts, approve actions, or attach to any session without leaving the dashboard.
+
+![AI Command Center — HUD view](screenshots/command-center.png)
+
+> **HUD view.** Each Claude Code session is a draggable folder card. Stack them, minimize them, drop new sessions in. The header strip surfaces active / idle / waiting / processing counts plus your 5-hour and 7-day usage bars, all read live from `~/.claude/rate-limits.json`. The "Add Task" menu spins up new sessions, windows, or split panes without touching the terminal.
+
+![Sessions table view](screenshots/sessions-table.png)
+
+> **Table view.** The same session set rendered as a dense dashboard — task name, pane, model, context window, turns, status, and the latest activity line for every Claude Code session running on your machine. Double-click any row to attach to that exact tmux pane in your terminal.
 
 ## How It Works
 

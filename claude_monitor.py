@@ -16,9 +16,12 @@ import glob
 import json
 import os
 import pathlib
+import queue
 import re
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 try:
@@ -33,11 +36,22 @@ except ImportError:
 # ── Config ───────────────────────────────────────────────────────────────
 REFRESH_MS = 3000
 CONTEXT_WINDOW = 200_000
+# Claude sessions can run with the extended window. Transcripts don't record
+# which one is in effect, so it is inferred from the largest context actually
+# observed (see _parse_session_jsonl).
+CONTEXT_WINDOW_LARGE = 1_000_000
 CLAUDE_DIR = os.path.expanduser("~/.claude")
 PROJECTS_DIR = os.path.join(CLAUDE_DIR, "projects")
+CODEX_DIR = os.path.expanduser("~/.codex")
+CODEX_SESSIONS_DIR = os.path.join(CODEX_DIR, "sessions")
+DEVIN_DB = os.path.expanduser("~/.local/share/devin/cli/sessions.db")
+DEVIN_LOCK_DIR = os.path.expanduser("~/.local/share/devin/cli/session_locks")
+# Devin's own footer reports "Context: 85k / 1.0M tokens"; the DB stores the
+# used-token count but not the window size, so this mirrors what Devin shows.
+DEVIN_CONTEXT_WINDOW = 1_000_000
 
 # All agent CLI names to detect
-AGENT_KEYWORDS = ["claude", "gemini", "codex"]
+AGENT_KEYWORDS = ["claude", "gemini", "codex", "devin"]
 
 # ── Theme ────────────────────────────────────────────────────────────────
 BG = "#0d1117"
@@ -57,10 +71,18 @@ ANSI_RE = re.compile(
 )
 
 
-def _run(cmd, timeout=5):
+def _run(cmd, timeout=5, check=True):
+    """Run a command and return stdout ("" on failure).
+
+    check=False keeps stdout even on a non-zero exit, for tools like lsof that
+    report 1 whenever any path was inaccessible while still printing usable
+    output.
+    """
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.stdout if r.returncode == 0 else ""
+        if check and r.returncode != 0:
+            return ""
+        return r.stdout
     except Exception:
         return ""
 
@@ -69,8 +91,62 @@ def _strip(s):
     return ANSI_RE.sub("", s)
 
 
+SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+def _is_highlighted(raw_line, clean_line):
+    """True if a TUI menu row looks like the active one.
+
+    Devin highlights the selected row with reverse video (or a background
+    colour) instead of a glyph, and _strip() removes that, so this has to run
+    against the raw line. Glyph markers are still honoured for agents that use
+    them.
+    """
+    if clean_line.startswith(("❯", "❭", ">", "●", "▸", "▶", "→")):
+        return True
+    for params in SGR_RE.findall(raw_line):
+        codes = [p for p in params.split(";") if p]
+        if not codes:            # bare "\x1b[m" is a reset
+            continue
+        for i, code in enumerate(codes):
+            if code == "7":                       # reverse video
+                return True
+            if code in ("48", "38"):              # extended colour, skip args
+                break
+            if code.isdigit() and (40 <= int(code) <= 47 or 100 <= int(code) <= 107):
+                return True                       # explicit background colour
+        if "48" in codes:                         # 256/truecolor background
+            return True
+    return False
+
+
+def _flat_button(parent, text, command, bg=BORDER, fg=FG,
+                 hover_bg=SEL_BG, hover_fg="#ffffff",
+                 font=("Menlo", 10, "bold")):
+    """A clickable Label styled as a button.
+
+    On macOS (windowingsystem "aqua") tk.Button renders with the native theme
+    and ignores -background, so the dark-themed buttons came out white with
+    pale grey text and read as disabled. Labels honour the colours, so this
+    reproduces the button behaviour by hand.
+    """
+    btn = tk.Label(parent, text=text, bg=bg, fg=fg, font=font, padx=10, pady=3)
+
+    btn.bind("<Button-1>", lambda _e: command())
+    btn.bind("<Enter>", lambda _e: btn.config(bg=hover_bg, fg=hover_fg))
+    btn.bind("<Leave>", lambda _e: btn.config(bg=bg, fg=fg))
+    try:
+        btn.config(cursor="pointinghand")
+    except tk.TclError:
+        btn.config(cursor="hand2")
+    return btn
+
+
 def _bar(pct, width=12):
-    filled = round(pct / 100 * width)
+    # Clamp: an over-100% reading would otherwise render a bar wider than
+    # `width` (the padding term goes negative and yields ""), which knocks the
+    # whole column out of alignment.
+    filled = max(0, min(width, round(pct / 100 * width)))
     return "\u2588" * filled + "\u2591" * (width - filled)
 
 
@@ -83,18 +159,213 @@ def _fmt_tokens(n):
 
 
 # ── JSONL session data ──────────────────────────────────────────────────
+# Re-parsing every transcript on each refresh dominated the refresh cost, so
+# parsed results are memoised on (path, mtime, size) and only recomputed when
+# the file actually changes.
+_SESSION_CACHE: dict[str, tuple[tuple, dict]] = {}
+
+
+def _cached_parse(path, parser):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _SESSION_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    data = parser(path)
+    _SESSION_CACHE[path] = (key, data)
+    return data
+
+
+def _load_devin_sessions():
+    """Read context usage from Devin's CLI sqlite database.
+
+    Devin doesn't write Claude-style JSONL transcripts, so its panes never
+    matched a session and the Context column always read 0%. The DB is the same
+    source Devin's own footer uses. The schema is undocumented, so every failure
+    mode here degrades to "no data" rather than raising.
+    """
+    try:
+        st = os.stat(DEVIN_DB)
+    except OSError:
+        return {}
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _SESSION_CACHE.get(DEVIN_DB)
+    if hit and hit[0] == key:
+        return hit[1]
+
+    sessions = {}
+    try:
+        # Read-only URI so a live Devin process is never blocked or modified.
+        conn = sqlite3.connect(f"file:{DEVIN_DB}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = conn.execute("""
+                SELECT s.id, s.working_directory, s.model, s.last_activity_at,
+                       (SELECT json_extract(m.metadata, '$.num_tokens_preceding')
+                          FROM message_nodes m
+                         WHERE m.session_id = s.id
+                           AND json_extract(m.metadata,
+                                            '$.num_tokens_preceding') IS NOT NULL
+                         ORDER BY m.node_id DESC
+                         LIMIT 1)
+                  FROM sessions s
+            """).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+    for sid, cwd, model, last_activity, tokens in rows:
+        tokens = tokens or 0
+        sessions[f"devin:{sid}"] = {
+            "agent_type": "devin",
+            "working_directory": cwd or "",
+            "model": model or "",
+            "last_activity_at": last_activity or 0,
+            "input_tokens": tokens,
+            "output_tokens": 0,
+            "context_window": DEVIN_CONTEXT_WINDOW,
+            "ctx_pct": round(tokens / DEVIN_CONTEXT_WINDOW * 100, 1),
+            "num_turns": 0,
+            "first_user_msg": "",
+        }
+    _SESSION_CACHE[DEVIN_DB] = (key, sessions)
+    return sessions
+
+
+def _apply_live_context(sessions):
+    """Overlay Claude Code's own context reading onto the matching session.
+
+    Transcripts don't record which context window is in effect, so a 1M-window
+    session was measured against 200k and read ~5x too high. The statusline
+    payload in rate-limits.json carries the real window size and percentage,
+    keyed by session_id. It only ever describes the session that most recently
+    rendered a statusline; every other session keeps its transcript estimate.
+    """
+    try:
+        with open(RATE_LIMITS_FILE) as f:
+            data = json.load(f)
+        sid = data.get("session_id")
+        ctx = data.get("context_window") or {}
+        window = ctx.get("context_window_size")
+        if not sid or sid not in sessions or not window:
+            return
+        used = ctx.get("total_input_tokens")
+        if used is None:
+            cur = ctx.get("current_usage") or {}
+            used = _usage_total(cur)
+        sessions[sid] = {
+            **sessions[sid],
+            "context_window": window,
+            "input_tokens": used,
+            "ctx_pct": ctx.get("used_percentage",
+                               round(used / window * 100, 1) if window else 0),
+        }
+        display = (data.get("model") or {}).get("display_name")
+        if display:
+            sessions[sid]["model"] = display
+    except Exception:
+        pass
+
+
 def _load_all_sessions():
     sessions = {}
+    sessions.update(_load_codex_sessions())
+    sessions.update(_load_devin_sessions())
+    seen = set()
     for proj_dir in glob.glob(os.path.join(PROJECTS_DIR, "*")):
         if not os.path.isdir(proj_dir):
             continue
         for jf in glob.glob(os.path.join(proj_dir, "*.jsonl")):
             sid = os.path.basename(jf).replace(".jsonl", "")
+            seen.add(jf)
             try:
-                sessions[sid] = _parse_session_jsonl(jf)
+                data = _cached_parse(jf, _parse_session_jsonl)
             except Exception:
                 continue
+            if data is not None:
+                sessions[sid] = data
+    # Drop cache entries for transcripts that no longer exist.
+    for stale in [p for p in _SESSION_CACHE
+                  if p.startswith(PROJECTS_DIR) and p not in seen]:
+        _SESSION_CACHE.pop(stale, None)
+    _apply_live_context(sessions)
     return sessions
+
+
+def _load_codex_sessions():
+    sessions = {}
+    pattern = os.path.join(CODEX_SESSIONS_DIR, "**", "*.jsonl")
+    for jf in glob.glob(pattern, recursive=True):
+        try:
+            data = _cached_parse(jf, _parse_codex_session_jsonl)
+        except Exception:
+            continue
+        if data is not None:
+            sessions[f"codex:{os.path.basename(jf).replace('.jsonl', '')}"] = data
+    return sessions
+
+
+def _parse_codex_session_jsonl(path):
+    first_user_text = None
+    user_messages = []
+    last_token = None
+    last_rate_limits = None
+    context_window = CONTEXT_WINDOW
+    num_turns = 0
+    cwd = None
+
+    with open(path) as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = d.get("payload", {})
+            if d.get("type") == "session_meta":
+                cwd = payload.get("cwd", cwd)
+            if d.get("type") == "event_msg" and payload.get("type") == "user_message":
+                t = payload.get("message") or ""
+                if t and not t.startswith("/"):
+                    if first_user_text is None:
+                        first_user_text = t
+                    user_messages.append(t)
+            if d.get("type") == "event_msg" and payload.get("type") == "token_count":
+                info = payload.get("info", {})
+                last_token = info
+                last_rate_limits = payload.get("rate_limits")
+                context_window = info.get("model_context_window") or context_window
+                num_turns += 1
+
+    usage = (last_token or {}).get("last_token_usage", {})
+    total_usage = (last_token or {}).get("total_token_usage", {})
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+
+    return dict(
+        agent_type="codex",
+        model=None,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        context_window=context_window,
+        ctx_pct=round(input_tokens / context_window * 100, 1) if context_window else 0,
+        first_user_msg=first_user_text or "",
+        user_messages=user_messages,
+        total_output=total_usage.get("output_tokens", 0),
+        num_turns=num_turns,
+        rate_limits=last_rate_limits,
+        mtime=os.path.getmtime(path),
+        cwd=cwd,
+    )
+
+
+def _usage_total(usage):
+    """Context size for one request: fresh input plus both cache tiers."""
+    return (usage.get("input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0))
 
 
 def _parse_session_jsonl(path):
@@ -104,6 +375,7 @@ def _parse_session_jsonl(path):
     user_messages = []
     total_output = 0
     num_turns = 0
+    max_ctx = 0
 
     with open(path) as f:
         for line in f:
@@ -123,22 +395,26 @@ def _parse_session_jsonl(path):
                 model = msg.get("model", model)
                 total_output += last_usage.get("output_tokens", 0)
                 num_turns += 1
+                max_ctx = max(max_ctx, _usage_total(last_usage))
 
     if not last_usage:
         return dict(model=model, input_tokens=0, output_tokens=0,
-                    ctx_pct=0, first_user_msg=first_user_text or "",
+                    ctx_pct=0, context_window=CONTEXT_WINDOW,
+                    first_user_msg=first_user_text or "",
                     user_messages=user_messages,
                     total_output=0, num_turns=0)
 
-    inp = last_usage.get("input_tokens", 0)
-    cache_create = last_usage.get("cache_creation_input_tokens", 0)
-    cache_read = last_usage.get("cache_read_input_tokens", 0)
-    total_ctx = inp + cache_create + cache_read
+    total_ctx = _usage_total(last_usage)
+    # Pick the smallest standard window the session actually fits in. Without
+    # this a 1M-window session reported >100% and rendered an oversized bar.
+    context_window = (CONTEXT_WINDOW_LARGE if max_ctx > CONTEXT_WINDOW
+                      else CONTEXT_WINDOW)
 
     return dict(
         model=model, input_tokens=total_ctx,
         output_tokens=last_usage.get("output_tokens", 0),
-        ctx_pct=round(total_ctx / CONTEXT_WINDOW * 100, 1) if CONTEXT_WINDOW else 0,
+        context_window=context_window,
+        ctx_pct=round(total_ctx / context_window * 100, 1) if context_window else 0,
         first_user_msg=first_user_text or "",
         user_messages=user_messages,
         total_output=total_output, num_turns=num_turns,
@@ -185,6 +461,11 @@ def _load_usage_stats():
         "subscription": None, "tier": None,
         "five_h_pct": None, "seven_d_pct": None,
         "five_h_resets": None, "seven_d_resets": None,
+        "codex_primary_pct": None, "codex_primary_resets": None,
+        "codex_primary_window": None,
+        "codex_secondary_pct": None, "codex_secondary_resets": None,
+        "codex_secondary_window": None,
+        "codex_plan": None,
     }
 
     # Read credentials for subscription info
@@ -256,7 +537,49 @@ def _load_usage_stats():
 
     stats["today_sessions"] = len(today_session_ids)
     stats["week_sessions"] = len(week_session_ids)
+    stats.update(_read_codex_rate_limits())
     return stats
+
+
+def _fmt_window(minutes):
+    if minutes is None:
+        return None
+    if minutes % 10080 == 0:
+        weeks = minutes // 10080
+        return "7d" if weeks == 1 else f"{weeks}w"
+    if minutes % 1440 == 0:
+        days = minutes // 1440
+        return "24h" if days == 1 else f"{days}d"
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
+def _read_codex_rate_limits():
+    result = {
+        "codex_primary_pct": None, "codex_primary_resets": None,
+        "codex_primary_window": None,
+        "codex_secondary_pct": None, "codex_secondary_resets": None,
+        "codex_secondary_window": None,
+        "codex_plan": None,
+    }
+    codex_sessions = _load_codex_sessions()
+    latest = max(codex_sessions.values(), key=lambda s: s.get("mtime", 0), default=None)
+    if not latest:
+        return result
+    rl = latest.get("rate_limits") or {}
+    result["codex_plan"] = rl.get("plan_type")
+    for prefix, data in (("primary", rl.get("primary")), ("secondary", rl.get("secondary"))):
+        if not isinstance(data, dict):
+            continue
+        out_prefix = f"codex_{prefix}"
+        result[f"{out_prefix}_pct"] = data.get("used_percent")
+        result[f"{out_prefix}_window"] = _fmt_window(data.get("window_minutes"))
+        if data.get("resets_at"):
+            result[f"{out_prefix}_resets"] = datetime.fromtimestamp(
+                data["resets_at"]).strftime("Resets %a %I:%M %p")
+    return result
 
 
 def _read_rate_limits():
@@ -366,8 +689,39 @@ def _has_claude_descendant(pid, depth=3):
     return _detect_agent_from_proc(pid, depth) is not None
 
 
+def _devin_lock_owners():
+    """Map pid -> devin session id via the lock each running session holds.
+
+    Two Devin sessions can be started from the same directory, so the working
+    directory can't tell them apart; the lock file name can.
+    """
+    owners = {}
+    for line in _run(["lsof", "+D", DEVIN_LOCK_DIR],
+                     check=False).splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        m = re.search(r"([^/\s]+)\.lock$", parts[-1])
+        if m:
+            owners[parts[1]] = m.group(1)
+    return owners
+
+
+def _devin_session_for_pane(pid, owners, depth=3):
+    """Walk a pane's process tree to the devin process and return its session."""
+    if depth <= 0 or not owners:
+        return None
+    if str(pid) in owners:
+        return owners[str(pid)]
+    for child in _run(["pgrep", "-P", str(pid)]).split():
+        found = _devin_session_for_pane(child.strip(), owners, depth - 1)
+        if found:
+            return found
+    return None
+
+
 def get_claude_panes():
-    """Return all panes running any supported agent (Claude, Gemini, Codex)."""
+    """Return all panes running any supported agent."""
     fmt = "\t".join([
         "#{session_name}", "#{window_index}", "#{pane_index}",
         "#{pane_id}", "#{pane_current_command}", "#{pane_pid}",
@@ -412,15 +766,58 @@ def _is_gemini_waiting(vis_lines):
     return False
 
 
-def read_pane_content(target):
+def _last_prompt_line(vis_lines):
+    for line in reversed(vis_lines):
+        c = _strip(line).strip()
+        if c.startswith(("❯", "❭", "›")):
+            return c
+    return ""
+
+
+def _status_from_prompt(vis_lines, agent_type):
+    """Classify only the latest prompt block, not stale prompts in scrollback."""
+    clean = [_strip(line).strip() for line in vis_lines]
+    prompt_idx = None
+    prompt_line = ""
+    for i in range(len(clean) - 1, -1, -1):
+        if clean[i].startswith(("❯", "❭", "›")):
+            prompt_idx, prompt_line = i, clean[i]
+            break
+    if prompt_idx is None:
+        return None
+
+    # If agent output appears after the last submitted prompt, it is still working.
+    chrome_hints = (
+        "CTX", "5H", "7D", "manual mode", "for shortcuts", "to start fresh",
+        "Press opt+t", "cycle thinking levels", "select ·", "confirm ·", "esc cancel",
+    )
+    box_chars = set("─━═╔╗╚╝║│┌┐└┘├┤┬┴┼ ")
+    after_prompt = []
+    for line in clean[prompt_idx + 1:]:
+        if not line or set(line) <= box_chars or any(h in line for h in chrome_hints):
+            continue
+        after_prompt.append(line)
+    if after_prompt:
+        return "Working"
+
+    prompt_text = prompt_line.lstrip("❯❭›>  ").strip()
+    idle_placeholders = ("Ask Devin to", "Ask Claude", "Ask Codex", "? for shortcuts")
+    if not prompt_text or any(prompt_text.startswith(p) for p in idle_placeholders):
+        return "Idle"
+    return "Waiting for input"
+
+
+def read_pane_content(target, agent_type=None):
     scrollback = _run(["tmux", "capture-pane", "-t", target, "-p", "-S", "-200"])
     visible = _run(["tmux", "capture-pane", "-t", target, "-p"])
     all_lines = scrollback.splitlines() if scrollback else visible.splitlines()
     vis_lines = visible.splitlines()
 
+    forced_agent = agent_type if agent_type in AGENT_KEYWORDS else None
     info = dict(model=None, version=None, status="Idle", activity="",
                 first_user_msg=None, prompt_options=[], prompt_desc="",
-                agent_type="claude")
+                nav_selected=None,
+                agent_type=forced_agent or "claude")
 
     for line in all_lines:
         c = _strip(line).strip()
@@ -436,24 +833,38 @@ def read_pane_content(target):
         m = re.search(r"Claude Code\s+(v[\d.]+)", c, re.I)
         if m:
             info["version"] = m.group(1)
+        # Devin version/model detection
+        m = re.search(r"\bDevin(?: for Terminal| CLI)?\b", c, re.I)
+        if m and not forced_agent:
+            info["agent_type"] = "devin"
+        m = re.search(r"\bv\d{4}\.\d+\.\d+(?:-\d+)?\b|\bv\d{3,}\.\d+\.\d+\b", c)
+        if m and info["agent_type"] == "devin":
+            info["version"] = m.group(0)
+        m = re.search(r"\bClaude\s+(Opus|Sonnet|Haiku)\s+[\d.]+\s+Max\b", c, re.I)
+        if m and info["agent_type"] == "devin":
+            info["model"] = c.split("Context:", 1)[0].split("Press ", 1)[0].strip()
         # Gemini model detection
         m = re.search(r"(gemini-[\w.-]+)", c, re.I)
-        if m:
+        if m and not forced_agent:
             info["model"] = m.group(1)
             info["agent_type"] = "gemini"
-        if re.search(r"\bgemini\b", c, re.I) and not info["model"]:
+        if re.search(r"\bgemini\b", c, re.I) and not info["model"] and not forced_agent:
             info["agent_type"] = "gemini"
         # Codex model detection
         m = re.search(r"(codex-[\w.-]+|gpt-[\w.-]+)", c, re.I)
-        if m and info["agent_type"] == "claude":
+        if m and info["agent_type"] == "claude" and not forced_agent:
             info["model"] = m.group(1)
             info["agent_type"] = "codex"
+        # Devin detection
+        if re.search(r"\bdevin\b", c, re.I) and not forced_agent:
+            info["agent_type"] = "devin"
 
     for i, line in enumerate(all_lines):
         c = _strip(line).strip()
-        if c.startswith("\u276f") or c.startswith("❯"):
-            msg_part = c.lstrip("\u276f❯ ").strip()
-            if msg_part and len(msg_part) > 2 and not msg_part.startswith("/"):
+        if c.startswith(("\u276f", "❯", "❭", "›")):
+            msg_part = c.lstrip("\u276f❯❭›  ").strip()
+            if (msg_part and len(msg_part) > 2 and not msg_part.startswith("/")
+                    and not msg_part.startswith("Ask Devin to")):
                 info["first_user_msg"] = msg_part
                 break
 
@@ -464,16 +875,24 @@ def read_pane_content(target):
         "1. Yes", "2. Yes, and don", "3. No",
         "1. Allow", "2. Allow always", "3. Deny",
     ]
-    has_approval = any(kw in vis_text for kw in approval_keywords)
+    parsed_opts, parsed_desc, nav_selected = _parse_prompt_options(vis_lines)
+
+    # Detect y/N or Y/n style prompts (common in Gemini CLI and other agents)
+    yn_match = re.search(r'\?\s*\(([yYnN])/([yYnN])\)', vis_text)
+    if not parsed_opts and yn_match:
+        yes_key, no_key = yn_match.group(1), yn_match.group(2)
+        parsed_opts = [("1", yes_key.upper()), ("2", no_key.upper())]
+        parsed_desc = re.sub(r'\s*\([yYnN]/[yYnN]\)', '', vis_text.strip().splitlines()[-1]).strip()
+
+    has_approval = (any(kw in vis_text for kw in approval_keywords)
+                    or len(parsed_opts) >= 2)
     if has_approval:
         info["status"] = "Needs approval"
-        info["prompt_options"], info["prompt_desc"] = _parse_prompt_options(vis_lines)
-    elif "❯" in vis_text or "\u276f" in vis_text:
-        last_prompt_after = vis_text.split("❯")[-1] if "❯" in vis_text else ""
-        if "? for shortcuts" in last_prompt_after and not last_prompt_after.strip().replace("? for shortcuts", "").replace("─", "").strip():
-            info["status"] = "Idle"
-        else:
-            info["status"] = "Waiting for input"
+        info["prompt_options"] = parsed_opts
+        info["prompt_desc"] = parsed_desc
+        info["nav_selected"] = nav_selected
+    elif (prompt_status := _status_from_prompt(vis_lines, info["agent_type"])):
+        info["status"] = prompt_status
     elif _is_gemini_idle(vis_lines):
         info["status"] = "Idle"
     elif _is_gemini_waiting(vis_lines):
@@ -489,10 +908,34 @@ def read_pane_content(target):
         "check", "deploy", "start", "finish", "download", "upload",
         "searched", "scanning", "processing",
     }
-    statusbar_hints = {"Auto-update", "claude doctor", "npm i -g"}
+    statusbar_hints = {
+        "Auto-update", "claude doctor", "npm i -g",
+        "Press opt+t", "remaining (resets", "Context:",
+        # Claude Code's own status bar sits below the prompt, so the bottom-up
+        # scan reaches it first. "for agents" in particular contains the
+        # "agent" stem and would otherwise always win.
+        "manual mode on", "for agents", "/effort", "for shortcuts",
+        "ctrl+o to expand", "esc to interrupt", "Tip: Use",
+        "CTX ", "5H ", "7D ",
+    }
     skip = {"? for shortcuts", "❯", "\u276f", "for shortcuts",
-            "Esc to cancel", "Tab to amend"}
+            "Esc to cancel", "Tab to amend", "❭ Ask Devin to"}
+    # Claude Code marks its current action with a spinner glyph ("✻ Reticulating…
+    # (12s · ↓ 4.1k tokens)") and finished steps with "⏺". Neither wording
+    # contains an action stem, so match the glyphs directly and prefer them.
+    if info["agent_type"] == "claude":
+        for line in reversed(vis_lines[-40:]):
+            c = _strip(line).strip()
+            if any(h in c for h in statusbar_hints):
+                continue
+            m_act = re.match(r"^[⏺✻✽✢✶✳*]\s+(.{4,})", c)
+            if m_act:
+                info["activity"] = m_act.group(1).strip()[:120]
+                break
+
     for line in reversed(vis_lines[-40:]):
+        if info["activity"]:
+            break
         c = _strip(line).strip()
         if len(c) < 4 or any(c.startswith(s) for s in skip):
             continue
@@ -512,42 +955,103 @@ def read_pane_content(target):
                 info["activity"] = c[:120]
                 break
 
-    if not info["activity"]:
+    if info["agent_type"] == "devin" and info["status"] == "Idle":
+        info["activity"] = "Idle"
+    elif not info["activity"]:
         info["activity"] = info["status"]
 
     return info
 
 
 def _parse_prompt_options(vis_lines):
+    """Returns (options, description, nav_selected).
+
+    nav_selected is the index of the currently highlighted row for arrow-key
+    menus, or None if it could not be determined (and for numbered menus).
+    """
     options = []
     desc_parts = []
+    nav_selected = None
+    in_approval_block = False
+    option_label_re = re.compile(
+        r"^(yes|no|allow|deny|always allow|allow once|y|n)\b", re.I
+    )
+    approval_markers = (
+        "Bash command", "Edit file", "Read file", "Write file",
+        "Execute", "Run", "Running command", "This command requires approval",
+        "Do you want to proceed", "Do you want to allow",
+        "Would you like to run", "Contains command_substitution",
+        "Requires approval",
+    )
+    clean_lines = [_strip(line).strip() for line in vis_lines]
+    nav_footer = any(
+        ("select" in line.lower() and "confirm" in line.lower()
+         and "cancel" in line.lower())
+        for line in clean_lines[-30:]
+    )
     for line in vis_lines:
         c = _strip(line).strip()
         if not c:
             continue
         # Capture tool/action description
-        if any(kw in c for kw in ("Bash command", "Edit file", "Read file",
-                                   "Write file", "Execute", "Run")):
+        if any(kw in c for kw in approval_markers):
+            in_approval_block = True
             desc_parts.append(c)
             continue
         # Match numbered options: "1. Yes", " 2) No", "3 - Allow", etc.
         # Also handles leading special chars like ❯, >, ●, etc.
-        cleaned = re.sub(r'^[^\d]*', '', c)  # strip non-digit prefix
-        m = re.match(r'(\d+)\s*[.):\-]\s*(.+)', cleaned)
+        m = re.match(r'^[\s❯❭>●○*\-]*(\d{1,2})\s*[.):\-]\s+(.+)', c)
         if m:
             num, label = m.group(1), m.group(2).strip().rstrip(':')
-            if label and len(label) > 1:
+            if in_approval_block and label and option_label_re.match(label):
                 options.append((num, label))
+    # Devin renders an arrow-key menu without option numbers. Only parse these
+    # when its select/confirm/cancel footer proves that this is an active menu,
+    # avoiding false positives from ordinary assistant bullet lists.
+    if not options and nav_footer:
+        nav_options = []
+        highlighted = []
+        for raw, c in list(zip(vis_lines, clean_lines))[-30:]:
+            m = re.match(r'^[❯❭>●○*·•\-\s]*(yes|no|allow|deny)(.*)$', c, re.I)
+            if m:
+                label = (m.group(1) + m.group(2)).strip()
+                if _is_highlighted(raw, c):
+                    highlighted.append(len(nav_options))
+                nav_options.append(label)
+        # Devin marks the active row with reverse video rather than a glyph, so
+        # the highlight only survives if we look at the raw line. When exactly
+        # one row is marked we can navigate relative to it; otherwise fall back
+        # to pinning the cursor at the top first (see _send_option).
+        nav_selected = highlighted[0] if len(highlighted) == 1 else None
+        options = [
+            (f"nav:{idx}", label) for idx, label in enumerate(nav_options)
+        ]
     # Deduplicate by option number
     seen_nums, clean = set(), []
     for num, label in options:
         if num not in seen_nums:
             seen_nums.add(num)
             clean.append((num, label))
-    return clean, " ".join(desc_parts).strip()[:200]
+    return clean, " ".join(desc_parts).strip()[:200], nav_selected
 
 
 def match_pane_to_session(pane_info, sessions):
+    if pane_info.get("agent_type") == "devin":
+        # Identified exactly by the session lock the devin process holds. A
+        # session with no messages yet has no DB row, so it correctly resolves
+        # to nothing rather than borrowing another session's token count.
+        sid = pane_info.get("devin_session")
+        key = f"devin:{sid}" if sid else None
+        return key if key in sessions else None
+
+    if pane_info.get("agent_type") == "codex":
+        codex_sessions = [
+            (sid, sdata) for sid, sdata in sessions.items()
+            if sdata.get("agent_type") == "codex"
+        ]
+        if codex_sessions and not pane_info.get("first_user_msg"):
+            return max(codex_sessions, key=lambda item: item[1].get("mtime", 0))[0]
+
     pane_msg = pane_info.get("first_user_msg", "")
     if not pane_msg:
         return None
@@ -669,6 +1173,7 @@ AGENTS = [
     ("Claude Code", "claude"),
     ("Gemini CLI", "gemini"),
     ("Codex CLI", "codex"),
+    ("Devin", "devin"),
 ]
 
 SKILLS_DIR = pathlib.Path.home() / ".claude" / "skills"
@@ -766,7 +1271,12 @@ class Monitor:
         self._group_iids: dict[str, str] = {}     # session_name -> treeview iid
         self._window_iids: dict[str, str] = {}    # "session:win_idx" -> treeview iid
         self._cached_usage: dict = {}             # cached /usage scrape result
+        self._btn_sig = None                      # (target, options) currently rendered
+        self._refreshing = False                  # a background gather is in flight
+        self._refresh_pending = False             # a refresh was requested mid-gather
+        self._result_q: queue.Queue = queue.Queue()  # worker thread -> UI thread
         self._build()
+        self._drain_results()
         self._tick()
         self._poll_usage()
 
@@ -846,6 +1356,7 @@ class Monitor:
         sections = [
             ("5h", "5 Hour Limit"),
             ("7d", "Weekly Limit"),
+            ("codex", "Codex Limit"),
             ("today", "Today"),
             ("plan", "Plan"),
         ]
@@ -858,7 +1369,7 @@ class Monitor:
             tk.Label(f, text=title, bg=SURFACE, fg=DIM,
                      font=("Menlo", 10)).pack(anchor="w")
             # Progress bar for limit sections
-            if key in ("5h", "7d"):
+            if key in ("5h", "7d", "codex"):
                 bar_frame = tk.Frame(f, bg=SURFACE)
                 bar_frame.pack(anchor="w", fill="x", pady=(2, 0))
                 bar_lbl = tk.Label(bar_frame, text="\u2591" * 20, bg=SURFACE, fg=DIM,
@@ -904,6 +1415,22 @@ class Monitor:
             self._set_limit_bar("7d", None)
             self._usage_labels["7d"].config(
                 text=f"{stats['week_messages']} msgs  |  {_fmt_tokens(stats['week_tokens'])} tok  |  {stats['week_sessions']} sess")
+
+        # Today
+        codex_bits = []
+        cp = stats.get("codex_primary_pct")
+        if cp is not None:
+            codex_bits.append(f"{stats.get('codex_primary_window') or 'limit'} {cp:.0f}%")
+        cs = stats.get("codex_secondary_pct")
+        if cs is not None:
+            codex_bits.append(f"{stats.get('codex_secondary_window') or 'limit'} {cs:.0f}%")
+        if codex_bits:
+            display_pct = cp if cp is not None else cs
+            self._set_limit_bar("codex", display_pct)
+            self._usage_labels["codex"].config(text="  |  ".join(codex_bits))
+        else:
+            self._set_limit_bar("codex", None)
+            self._usage_labels["codex"].config(text="--")
 
         # Today
         self._usage_labels["today"].config(
@@ -983,16 +1510,15 @@ class Monitor:
         self._interact_label.pack(side="left")
         self._btn_frame = tk.Frame(row1, bg=SURFACE)
         self._btn_frame.pack(side="right")
-        self._esc_btn = tk.Button(
-            self._btn_frame, text="Esc (Cancel)", bg="#3d1f1f", fg=RED,
-            activebackground="#5c2626", activeforeground="#ff7b72",
-            font=("Menlo", 10, "bold"), bd=0, padx=10, pady=3,
-            command=self._send_escape)
+        self._esc_btn = _flat_button(
+            self._btn_frame, "Esc (Cancel)", self._send_escape,
+            bg="#3d1f1f", fg=RED, hover_bg="#5c2626", hover_fg="#ff7b72")
 
         row2 = tk.Frame(self._interact_frame, bg=SURFACE)
         row2.pack(fill="x", padx=12, pady=(0, 8))
-        tk.Label(row2, text="Type:", bg=SURFACE, fg=DIM,
-                 font=("Menlo", 11)).pack(side="left")
+        self._type_label = tk.Label(row2, text="Type:", bg=SURFACE, fg=DIM,
+                                     font=("Menlo", 11))
+        self._type_label.pack(side="left")
         self._text_entry = tk.Entry(
             row2, bg=BG, fg=FG, insertbackground=ACCENT,
             font=("Menlo", 12), bd=0, highlightbackground=BORDER,
@@ -1029,7 +1555,8 @@ class Monitor:
         info = self._pane_info.get(iid, {})
         status = info.get("status", "")
         pane_idx = self.tv.item(iid, "values")[0]
-        self._clear_option_buttons()
+        if status != "Needs approval":
+            self._clear_option_buttons()
 
         if status == "Needs approval":
             desc = info.get("prompt_desc", "")
@@ -1038,25 +1565,36 @@ class Monitor:
             if desc:
                 label += f"  \u2502  {desc[:80]}"
             self._interact_label.config(text=label, fg=YELLOW)
-            for num, lbl in options:
-                btn = tk.Button(
-                    self._btn_frame, text=f"{num}. {lbl}", bg=BORDER, fg=FG,
-                    activebackground=SEL_BG, activeforeground="#fff",
-                    font=("Menlo", 10, "bold"), bd=0, padx=10, pady=3,
-                    command=lambda n=num, t=target: self._send_option(t, n))
-                btn.pack(side="left", padx=(0, 6))
-            self._esc_btn.config(command=lambda t=target: self._send_escape(t))
+            self._type_label.config(text="Follow-up (opt):", fg=ACCENT)
+            # Only rebuild when the options actually changed. Destroying and
+            # re-packing these every refresh swallowed clicks that landed
+            # between mouse-down and mouse-up.
+            sig = (target, tuple(options))
+            if sig != self._btn_sig:
+                self._clear_option_buttons()
+                for display_num, (num, lbl) in enumerate(options, 1):
+                    btn = _flat_button(
+                        self._btn_frame, f"{display_num}. {lbl}",
+                        lambda n=num, t=target: self._send_option(t, n))
+                    btn.pack(side="left", padx=(0, 6))
+                self._btn_sig = sig
+            self._esc_btn.bind(
+                "<Button-1>", lambda _e, t=target: self._send_escape(t))
             self._esc_btn.pack(side="left")
         elif status == "Waiting for input":
+            self._type_label.config(text="Type:", fg=DIM)
             self._interact_label.config(
                 text=f"Pane {pane_idx} is waiting for your input", fg=ACCENT)
         elif status == "Idle":
+            self._type_label.config(text="Type:", fg=DIM)
             self._interact_label.config(
                 text=f"Pane {pane_idx} is idle — type a message below", fg=GREEN)
         elif status == "Working":
+            self._type_label.config(text="Type:", fg=DIM)
             self._interact_label.config(
                 text=f"Pane {pane_idx} is working...", fg=DIM)
         else:
+            self._type_label.config(text="Type:", fg=DIM)
             self._interact_label.config(text=f"Pane {pane_idx} — {status}", fg=FG)
 
     def _clear_option_buttons(self):
@@ -1064,9 +1602,35 @@ class Monitor:
             if w is not self._esc_btn:
                 w.destroy()
         self._esc_btn.pack_forget()
+        self._btn_sig = None
 
     def _send_option(self, target, num):
-        send_keys(target, num, enter=True)
+        num = str(num)
+        if num.startswith("nav:"):
+            want = int(num.split(":", 1)[1])
+            # Arrow-key menus are navigated relative to whatever row is
+            # highlighted right now, and that can have moved since this button
+            # was built (the refresh is up to REFRESH_MS old, and the user can
+            # arrow around in the terminal directly). Re-read it at click time.
+            fresh = read_pane_content(target)
+            current = fresh.get("nav_selected")
+            if current is None:
+                # Highlight undetectable: walk to the top so the index below is
+                # absolute rather than a guess.
+                for _ in range(max(len(fresh.get("prompt_options", [])) - 1, 0)):
+                    _run(["tmux", "send-keys", "-t", target, "Up"])
+                current = 0
+            delta = want - current
+            direction = "Down" if delta > 0 else "Up"
+            for _ in range(abs(delta)):
+                _run(["tmux", "send-keys", "-t", target, direction])
+            _run(["tmux", "send-keys", "-t", target, "Enter"])
+        else:
+            send_keys(target, num, enter=True)
+        extra = self._text_entry.get().strip()
+        if extra:
+            self._text_entry.delete(0, tk.END)
+            self.root.after(400, lambda: send_keys(target, extra, enter=True))
         self.root.after(800, self._refresh)
 
     def _send_escape(self, target=None):
@@ -1292,17 +1856,17 @@ class Monitor:
 
     def _exec_slash_command(self, target, command):
         """Run a slash command in a background thread and show result in popup."""
-        import threading
-
         # Show loading indicator
         self._interact_label.config(text=f"Running {command}...", fg=ACCENT)
 
         def _do():
             result = _run_slash_command(target, command)
-            self.root.after(0, lambda: self._show_result_popup(command, target, result))
+            # Tk is not thread-safe, so hand the popup back to the main thread
+            # via the result queue rather than calling root.after() here.
+            self._result_q.put(
+                ("popup", lambda: self._show_result_popup(command, target, result)))
 
-        t = threading.Thread(target=_do, daemon=True)
-        t.start()
+        threading.Thread(target=_do, daemon=True).start()
 
     # ── Skills ──
     def _show_skills_menu(self):
@@ -1515,9 +2079,74 @@ class Monitor:
             self._cached_usage = result
 
     def _refresh(self):
+        """Gather tmux/transcript state off-thread, then apply it on the UI thread.
+
+        All of this used to run inline on the Tk main loop every 3s, freezing
+        the window (and swallowing clicks) for as long as the tmux captures and
+        transcript parsing took.
+        """
+        if self._refreshing:
+            # Don't drop it — the refresh queued right after sending keys is the
+            # one showing the user the result of their click.
+            self._refresh_pending = True
+            return
+        self._refreshing = True
+        self._refresh_pending = False
+
+        def _gather():
+            try:
+                panes = get_claude_panes()
+                lock_owners = (_devin_lock_owners()
+                               if any(p.get("agent_type") == "devin" for p in panes)
+                               else {})
+                pane_infos = {}
+                for p in panes:
+                    info = read_pane_content(p["target"], p.get("agent_type"))
+                    info["agent_type"] = (p.get("agent_type")
+                                          or info.get("agent_type", "claude"))
+                    if info["agent_type"] == "devin":
+                        info["devin_session"] = _devin_session_for_pane(
+                            p["pid"], lock_owners)
+                    pane_infos[p["pane_id"]] = info
+                payload = (panes, pane_infos, _load_all_sessions(),
+                           _read_rate_limits())
+            except Exception:
+                payload = None
+            # Tk is not thread-safe — even root.after() from a worker thread
+            # raises "main thread is not in main loop". Hand the result over a
+            # queue that the main thread drains in _drain_results().
+            self._result_q.put(payload)
+
+        threading.Thread(target=_gather, daemon=True).start()
+
+    def _drain_results(self):
+        """Main-thread poll: apply any payloads the worker threads produced."""
+        try:
+            while True:
+                item = self._result_q.get_nowait()
+                # ("popup", fn) is a plain callable to run on the main thread;
+                # anything else is a refresh payload.
+                if isinstance(item, tuple) and item and item[0] == "popup":
+                    item[1]()
+                else:
+                    self._apply_refresh(item)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._drain_results)
+
+    def _apply_refresh(self, payload):
+        self._refreshing = False
+        if self._refresh_pending:
+            self._refresh_pending = False
+            self.root.after(100, self._refresh)
+        if payload is None:
+            return
+        panes, pane_infos, all_sessions, usage = payload
+
         now = time.strftime("%H:%M:%S")
         self.lbl_updated.config(text=f"Last updated: {now}")
-        self._poll_usage()
+        if usage.get("five_h_pct") is not None:
+            self._cached_usage = usage
         self._update_usage_panel()
 
         prev_sel = None
@@ -1525,19 +2154,19 @@ class Monitor:
         if sel and sel[0] in self._targets:
             prev_sel = self._targets[sel[0]]
 
-        for i in self.tv.get_children():
-            self.tv.delete(i)
         self._targets.clear()
         self._pane_info.clear()
         self._pane_data.clear()
         self._group_iids.clear()
         self._window_iids.clear()
+        desired_iids = set()
 
-        panes = get_claude_panes()
         n = len(panes)
         self.lbl_count.config(text=f"{n} pane{'s' * (n != 1)}")
 
         if not panes:
+            for iid in self.tv.get_children():
+                self.tv.delete(iid)
             self.tv.insert("", "end", text="", tags=("dim",), values=(
                 "\u2014", "\u2014", "No sessions detected",
                 "\u2014", "\u2014", "Start claude inside a tmux window"))
@@ -1551,40 +2180,59 @@ class Monitor:
             win = p["win_idx"]
             groups.setdefault(sess, OrderedDict()).setdefault(win, []).append(p)
 
-        all_sessions = _load_all_sessions()
         restore_iid = None
 
         for sess_name, windows in groups.items():
             total_panes = sum(len(pl) for pl in windows.values())
             # Session row
-            group_iid = self.tv.insert(
-                "", "end",
-                text=f"\u25b8 {sess_name}  ({total_panes} pane{'s' * (total_panes != 1)}, {len(windows)} win)",
-                tags=("group",), values=("", "", "", "", "", ""), open=True)
+            group_iid = f"group:{sess_name}"
+            group_text = f"\u25b8 {sess_name}  ({total_panes} pane{'s' * (total_panes != 1)}, {len(windows)} win)"
+            group_values = ("", "", "", "", "", "")
+            if self.tv.exists(group_iid):
+                self.tv.item(group_iid, text=group_text, tags=("group",),
+                             values=group_values)
+                self.tv.move(group_iid, "", "end")
+            else:
+                self.tv.insert("", "end", iid=group_iid, text=group_text,
+                               tags=("group",), values=group_values, open=True)
+            desired_iids.add(group_iid)
             self._group_iids[sess_name] = group_iid
 
             for win_idx, win_panes in windows.items():
                 win_name = win_panes[0].get("win_name", "")
                 wkey = f"{sess_name}:{win_idx}"
                 # Window row
-                win_iid = self.tv.insert(
-                    group_iid, "end",
-                    text=f"  \u25ab Window {win_idx}: {win_name}" if win_name else f"  \u25ab Window {win_idx}",
-                    tags=("window",), values=("", "", "", "", "", ""), open=True)
+                win_iid = f"window:{sess_name}:{win_idx}"
+                win_text = (f"  \u25ab Window {win_idx}: {win_name}"
+                            if win_name else f"  \u25ab Window {win_idx}")
+                win_values = ("", "", "", "", "", "")
+                if self.tv.exists(win_iid):
+                    self.tv.item(win_iid, text=win_text, tags=("window",),
+                                 values=win_values)
+                    self.tv.move(win_iid, group_iid, "end")
+                else:
+                    self.tv.insert(group_iid, "end", iid=win_iid,
+                                   text=win_text, tags=("window",),
+                                   values=win_values, open=True)
+                desired_iids.add(win_iid)
                 self._window_iids[wkey] = win_iid
 
                 for p in win_panes:
-                    pane_info = read_pane_content(p["target"])
+                    pane_info = pane_infos[p["pane_id"]]
                     sid = match_pane_to_session(pane_info, all_sessions)
                     sdata = all_sessions.get(sid, {}) if sid else {}
 
+                    default_window = (DEVIN_CONTEXT_WINDOW
+                                      if pane_info.get("agent_type") == "devin"
+                                      else CONTEXT_WINDOW)
+                    context_window = sdata.get("context_window", default_window)
                     input_tok = sdata.get("input_tokens", 0)
                     pct = sdata.get("ctx_pct", 0)
                     if input_tok > 0:
-                        ctx_str = f"{_bar(pct)} {_fmt_tokens(input_tok)}/{_fmt_tokens(CONTEXT_WINDOW)} ({pct:.0f}%)"
+                        ctx_str = f"{_bar(pct)} {_fmt_tokens(input_tok)}/{_fmt_tokens(context_window)} ({pct:.0f}%)"
                         tag = "ctx_green" if pct < 50 else "ctx_yellow" if pct < 80 else "ctx_red"
                     else:
-                        ctx_str = f"{_bar(0)} 0/{_fmt_tokens(CONTEXT_WINDOW)} (0%)"
+                        ctx_str = f"{_bar(0)} 0/{_fmt_tokens(context_window)} (0%)"
                         tag = "ctx_green"
 
                     raw_model = pane_info.get("model") or sdata.get("model") or ""
@@ -1603,10 +2251,18 @@ class Monitor:
                         "Needs approval": "\u26a0 Approval",
                     }
 
-                    iid = self.tv.insert(win_iid, "end", text="", tags=(tag,), values=(
+                    iid = f"pane:{p['pane_id']}"
+                    pane_values = (
                         p["pane_idx"], model_str, ctx_str, turns,
                         status_icons.get(status, status),
-                        (pane_info["activity"] or "\u2014")[:80]))
+                        (pane_info["activity"] or "\u2014")[:80])
+                    if self.tv.exists(iid):
+                        self.tv.item(iid, text="", tags=(tag,), values=pane_values)
+                        self.tv.move(iid, win_iid, "end")
+                    else:
+                        self.tv.insert(win_iid, "end", iid=iid, text="",
+                                       tags=(tag,), values=pane_values)
+                    desired_iids.add(iid)
                     self._targets[iid] = p["target"]
                     self._pane_info[iid] = pane_info
                     self._pane_data[iid] = {
@@ -1617,6 +2273,19 @@ class Monitor:
                     }
                     if p["target"] == prev_sel:
                         restore_iid = iid
+
+        # Delete only rows that disappeared. Stable pane IDs keep selections
+        # and button targets intact while the monitor refreshes.
+        def _descendants(parent=""):
+            result = []
+            for child in self.tv.get_children(parent):
+                result.extend(_descendants(child))
+                result.append(child)
+            return result
+
+        for iid in _descendants():
+            if iid not in desired_iids and self.tv.exists(iid):
+                self.tv.delete(iid)
 
         if restore_iid:
             self.tv.selection_set(restore_iid)

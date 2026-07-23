@@ -15,6 +15,7 @@ AGENTS = [
     ("Claude Code", "claude"),
     ("Gemini CLI", "gemini"),
     ("Codex CLI", "codex"),
+    ("Devin", "devin"),
 ]
 
 SLASH_COMMANDS = [

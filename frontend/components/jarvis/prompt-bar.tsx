@@ -6,7 +6,7 @@ import type { SkillDef } from "@/lib/eel-bridge"
 
 interface PromptBarProps {
   selectedTask: string | null
-  agentType?: "claude" | "gemini" | "codex"
+  agentType?: "claude" | "gemini" | "codex" | "devin"
   onSend: (message: string) => void
   promptOptions?: [string, string][]
   promptDesc?: string
@@ -84,8 +84,8 @@ export function PromptBar({
     setTimeout(() => inputRef.current?.focus(), 50)
   }
 
-  const agentLabel = agentType === "gemini" ? "Gemini" : agentType === "codex" ? "Codex" : "Claude"
-  const agentColor = agentType === "gemini" ? "text-blue-400" : agentType === "codex" ? "text-purple-400" : "text-cyan-400"
+  const agentLabel = agentType === "gemini" ? "Gemini" : agentType === "codex" ? "Codex" : agentType === "devin" ? "Devin" : "Claude"
+  const agentColor = agentType === "gemini" ? "text-blue-400" : agentType === "codex" ? "text-purple-400" : agentType === "devin" ? "text-emerald-400" : "text-cyan-400"
   const hasApproval = taskStatus === "Approval" && promptOptions && promptOptions.length > 0
 
   return (

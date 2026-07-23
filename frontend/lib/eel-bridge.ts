@@ -9,6 +9,12 @@
 
 // ── Data interfaces ─────────────────────────────────────────────────────
 
+declare global {
+  interface Window {
+    eel: Record<string, (...args: any[]) => () => Promise<any>>
+  }
+}
+
 export interface PaneData {
   session: string
   win_idx: string
@@ -17,7 +23,7 @@ export interface PaneData {
   pane_id: string
   target: string
   model: string
-  agent_type: "claude" | "gemini" | "codex"
+  agent_type: "claude" | "gemini" | "codex" | "devin"
   input_tokens: number
   context_pct: number
   context_window: number
@@ -51,6 +57,13 @@ export interface UsageStats {
   seven_d_pct: number | null
   five_h_resets: string | null
   seven_d_resets: string | null
+  codex_primary_pct: number | null
+  codex_primary_resets: string | null
+  codex_primary_window: string | null
+  codex_secondary_pct: number | null
+  codex_secondary_resets: string | null
+  codex_secondary_window: string | null
+  codex_plan: string | null
 }
 
 export interface AgentDef {
@@ -99,6 +112,9 @@ export const eel = {
       subscription: null, tier: null,
       five_h_pct: null, seven_d_pct: null,
       five_h_resets: null, seven_d_resets: null,
+      codex_primary_pct: null, codex_primary_resets: null, codex_primary_window: null,
+      codex_secondary_pct: null, codex_secondary_resets: null, codex_secondary_window: null,
+      codex_plan: null,
     }),
 
   getUsageStats: () =>
@@ -109,6 +125,9 @@ export const eel = {
       subscription: null, tier: null,
       five_h_pct: null, seven_d_pct: null,
       five_h_resets: null, seven_d_resets: null,
+      codex_primary_pct: null, codex_primary_resets: null, codex_primary_window: null,
+      codex_secondary_pct: null, codex_secondary_resets: null, codex_secondary_window: null,
+      codex_plan: null,
     }),
 
   sendKeys: (target: string, text: string, enter = true) =>

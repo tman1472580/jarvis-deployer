@@ -23,7 +23,7 @@ export interface TaskData {
   target: string
   pane_id: string
   model: string
-  agent_type: "claude" | "gemini" | "codex"
+  agent_type: "claude" | "gemini" | "codex" | "devin"
   contextUsed: number
   contextTotal: number
   turns: number
@@ -516,10 +516,57 @@ export default function AICommandCenter() {
                       {usageStats.week_messages ?? 0} msgs
                     </span>
                   )}
-                </div>
+	                </div>
 
-                {/* Today */}
-                <div className="w-px h-6 bg-cyan-700/30" />
+	                {/* Codex limits */}
+	                {usageStats.codex_primary_pct != null && (
+	                  <>
+	                    <div className="w-px h-6 bg-cyan-700/30" />
+	                    <div className="flex items-center gap-2">
+	                      <span className="text-[10px] font-mono text-purple-400/70 uppercase tracking-widest">
+	                        Codex {usageStats.codex_primary_window || "limit"}
+	                      </span>
+	                      <div className="flex gap-0.5">
+	                        {Array.from({ length: 10 }).map((_, i) => (
+	                          <div key={i} className={`w-1.5 h-3 ${
+	                            i < Math.round((usageStats.codex_primary_pct ?? 0) / 10)
+	                              ? (usageStats.codex_primary_pct ?? 0) < 50 ? "bg-emerald-400" : (usageStats.codex_primary_pct ?? 0) < 80 ? "bg-amber-400" : "bg-red-400"
+	                              : "bg-purple-900/40"
+	                          }`} />
+	                        ))}
+	                      </div>
+	                      <span className={`text-xs font-mono tabular-nums ${
+	                        (usageStats.codex_primary_pct ?? 0) < 50 ? "text-emerald-400" : (usageStats.codex_primary_pct ?? 0) < 80 ? "text-amber-400" : "text-red-400"
+	                      }`}>{usageStats.codex_primary_pct}%</span>
+	                    </div>
+	                  </>
+	                )}
+
+	                {usageStats.codex_secondary_pct != null && (
+	                  <>
+	                    <div className="w-px h-6 bg-cyan-700/30" />
+	                    <div className="flex items-center gap-2">
+	                      <span className="text-[10px] font-mono text-purple-400/70 uppercase tracking-widest">
+	                        Codex {usageStats.codex_secondary_window || "limit"}
+	                      </span>
+	                      <div className="flex gap-0.5">
+	                        {Array.from({ length: 10 }).map((_, i) => (
+	                          <div key={i} className={`w-1.5 h-3 ${
+	                            i < Math.round((usageStats.codex_secondary_pct ?? 0) / 10)
+	                              ? (usageStats.codex_secondary_pct ?? 0) < 50 ? "bg-emerald-400" : (usageStats.codex_secondary_pct ?? 0) < 80 ? "bg-amber-400" : "bg-red-400"
+	                              : "bg-purple-900/40"
+	                          }`} />
+	                        ))}
+	                      </div>
+	                      <span className={`text-xs font-mono tabular-nums ${
+	                        (usageStats.codex_secondary_pct ?? 0) < 50 ? "text-emerald-400" : (usageStats.codex_secondary_pct ?? 0) < 80 ? "text-amber-400" : "text-red-400"
+	                      }`}>{usageStats.codex_secondary_pct}%</span>
+	                    </div>
+	                  </>
+	                )}
+
+	                {/* Today */}
+	                <div className="w-px h-6 bg-cyan-700/30" />
                 <div className="flex items-center gap-2">
                   <span className="text-[10px] font-mono text-cyan-500/60 uppercase tracking-widest">Today</span>
                   <span className="text-xs font-mono text-cyan-300 tabular-nums">{usageStats.today_messages ?? 0} msgs</span>

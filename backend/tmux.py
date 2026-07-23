@@ -11,7 +11,7 @@ ANSI_RE = re.compile(
 )
 
 # All agent CLI names to detect
-AGENT_KEYWORDS = ["claude", "gemini", "codex"]
+AGENT_KEYWORDS = ["claude", "gemini", "codex", "devin"]
 
 
 def _run(cmd, timeout=5):
@@ -63,7 +63,7 @@ def _has_claude_descendant(pid, depth=3):
 
 
 def get_claude_panes():
-    """Return all panes running any supported agent (Claude, Gemini, Codex)."""
+    """Return all panes running any supported agent."""
     fmt = "\t".join([
         "#{session_name}", "#{window_index}", "#{pane_index}",
         "#{pane_id}", "#{pane_current_command}", "#{pane_pid}",
@@ -110,6 +110,14 @@ def _is_gemini_waiting(vis_lines):
     return False
 
 
+def _last_prompt_line(vis_lines):
+    for line in reversed(vis_lines):
+        c = _strip(line).strip()
+        if c.startswith(("❯", "❭")):
+            return c
+    return ""
+
+
 def read_pane_content(target):
     scrollback = _run(["tmux", "capture-pane", "-t", target, "-p", "-S", "-200"])
     visible = _run(["tmux", "capture-pane", "-t", target, "-p"])
@@ -134,6 +142,16 @@ def read_pane_content(target):
         m = re.search(r"Claude Code\s+(v[\d.]+)", c, re.I)
         if m:
             info["version"] = m.group(1)
+        # Devin version/model detection
+        m = re.search(r"\bDevin(?: for Terminal| CLI)?\b", c, re.I)
+        if m:
+            info["agent_type"] = "devin"
+        m = re.search(r"\bv\d{4}\.\d+\.\d+(?:-\d+)?\b|\bv\d{3,}\.\d+\.\d+\b", c)
+        if m and info["agent_type"] == "devin":
+            info["version"] = m.group(0)
+        m = re.search(r"\bClaude\s+(Opus|Sonnet|Haiku)\s+[\d.]+\s+Max\b", c, re.I)
+        if m and info["agent_type"] == "devin":
+            info["model"] = c.split("Context:", 1)[0].split("Press ", 1)[0].strip()
         # Gemini model detection
         m = re.search(r"(gemini-[\w.-]+)", c, re.I)
         if m:
@@ -146,12 +164,16 @@ def read_pane_content(target):
         if m and info["agent_type"] == "claude":
             info["model"] = m.group(1)
             info["agent_type"] = "codex"
+        # Devin detection
+        if re.search(r"\bdevin\b", c, re.I):
+            info["agent_type"] = "devin"
 
     for i, line in enumerate(all_lines):
         c = _strip(line).strip()
         if c.startswith("\u276f") or c.startswith("❯"):
             msg_part = c.lstrip("\u276f❯ ").strip()
-            if msg_part and len(msg_part) > 2:
+            if (msg_part and len(msg_part) > 2
+                    and not msg_part.startswith("Ask Devin to")):
                 info["first_user_msg"] = msg_part
                 break
 
@@ -162,13 +184,29 @@ def read_pane_content(target):
         "1. Yes", "2. Yes, and don", "3. No",
         "1. Allow", "2. Allow always", "3. Deny",
     ]
-    has_approval = any(kw in vis_text for kw in approval_keywords)
+    parsed_opts, parsed_desc = _parse_prompt_options(vis_lines)
+
+    # Detect y/N or Y/n style prompts used by non-Claude CLIs.
+    yn_match = re.search(r'\?\s*\(([yYnN])/([yYnN])\)', vis_text)
+    if not parsed_opts and yn_match:
+        yes_key, no_key = yn_match.group(1), yn_match.group(2)
+        parsed_opts = [("1", yes_key.upper()), ("2", no_key.upper())]
+        parsed_desc = re.sub(
+            r'\s*\([yYnN]/[yYnN]\)', '',
+            vis_text.strip().splitlines()[-1],
+        ).strip()
+
+    has_approval = (any(kw in vis_text for kw in approval_keywords)
+                    or len(parsed_opts) >= 2)
     if has_approval:
         info["status"] = "Needs approval"
-        info["prompt_options"], info["prompt_desc"] = _parse_prompt_options(vis_lines)
-    elif "❯" in vis_text or "\u276f" in vis_text:
-        last_prompt_after = vis_text.split("❯")[-1] if "❯" in vis_text else ""
-        if "? for shortcuts" in last_prompt_after and not last_prompt_after.strip().replace("? for shortcuts", "").replace("─", "").strip():
+        info["prompt_options"] = parsed_opts
+        info["prompt_desc"] = parsed_desc
+    elif "❯" in vis_text or "❭" in vis_text:
+        prompt_line = _last_prompt_line(vis_lines)
+        if prompt_line.startswith("❭ Ask Devin to"):
+            info["status"] = "Idle"
+        elif "? for shortcuts" in prompt_line and not prompt_line.replace("❯", "").replace("? for shortcuts", "").replace("─", "").strip():
             info["status"] = "Idle"
         else:
             info["status"] = "Waiting for input"
@@ -188,11 +226,17 @@ def read_pane_content(target):
         "check", "deploy", "start", "finish", "download", "upload",
         "searched", "scanning", "processing",
     }
+    statusbar_hints = {
+        "Auto-update", "claude doctor", "npm i -g",
+        "Press opt+t", "remaining (resets", "Context:",
+    }
     skip = {"? for shortcuts", "❯", "\u276f", "for shortcuts",
-            "Esc to cancel", "Tab to amend"}
+            "Esc to cancel", "Tab to amend", "❭ Ask Devin to"}
     for line in reversed(vis_lines[-40:]):
         c = _strip(line).strip()
         if len(c) < 4 or any(c.startswith(s) for s in skip):
+            continue
+        if any(h in c for h in statusbar_hints):
             continue
         if any(k in c.lower() for k in action_stems):
             info["activity"] = c[:120]
@@ -203,11 +247,14 @@ def read_pane_content(target):
         for line in reversed(vis_lines):
             c = _strip(line).strip()
             if (c and len(c) > 3 and not any(c.startswith(s) for s in skip)
-                    and not set(c) <= box_chars):
+                    and not set(c) <= box_chars
+                    and not any(h in c for h in statusbar_hints)):
                 info["activity"] = c[:120]
                 break
 
-    if not info["activity"]:
+    if info["agent_type"] == "devin" and info["status"] == "Idle":
+        info["activity"] = "Idle"
+    elif not info["activity"]:
         info["activity"] = info["status"]
 
     return info
@@ -224,8 +271,7 @@ def _parse_prompt_options(vis_lines):
                                    "Write file", "Execute", "Run")):
             desc_parts.append(c)
             continue
-        cleaned = re.sub(r'^[^\d]*', '', c)
-        m = re.match(r'(\d+)\s*[.):\-]\s*(.+)', cleaned)
+        m = re.match(r'^[\s❯❭>●○*\-]*(\d{1,2})\s*[.):\-]\s+(.+)', c)
         if m:
             num, label = m.group(1), m.group(2).strip().rstrip(':')
             if label and len(label) > 1:

@@ -54,9 +54,11 @@ def get_full_state():
             win_name = win_panes[0].get("win_name", "")
             for p in win_panes:
                 pane_info = read_pane_content(p["target"])
+                pane_info["agent_type"] = p.get("agent_type") or pane_info.get("agent_type", "claude")
                 sid = match_pane_to_session(pane_info, all_sessions)
                 sdata = all_sessions.get(sid, {}) if sid else {}
 
+                context_window = sdata.get("context_window", CONTEXT_WINDOW)
                 input_tok = sdata.get("input_tokens", 0)
                 ctx_pct = sdata.get("ctx_pct", 0)
                 model_str = pane_info.get("model") or sdata.get("model") or ""
@@ -70,10 +72,10 @@ def get_full_state():
                     "pane_id": p["pane_id"],
                     "target": p["target"],
                     "model": model_str,
-                    "agent_type": p.get("agent_type") or pane_info.get("agent_type", "claude"),
+                    "agent_type": pane_info["agent_type"],
                     "input_tokens": input_tok,
                     "context_pct": ctx_pct,
-                    "context_window": CONTEXT_WINDOW,
+                    "context_window": context_window,
                     "turns": turns,
                     "status": pane_info["status"],
                     "activity": pane_info.get("activity", ""),
@@ -203,7 +205,7 @@ def get_available_skills():
 
 @eel.expose
 def run_agent_skill(target, skill_slug, user_prompt=""):
-    """Send a skill's instructions to any agent pane (Claude, Gemini, Codex)."""
+    """Send a skill's instructions to any supported agent pane."""
     run_skill(target, skill_slug, user_prompt)
 
 

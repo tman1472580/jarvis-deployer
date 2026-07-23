@@ -11,7 +11,7 @@ interface SessionInfo {
 }
 
 interface HudHeaderProps {
-  onAddTask?: (agentCmd: string, agentLabel: string) => void
+  onAddTask?: (agentCmd: string, agentLabel: string, cwd?: string) => void
   onNewWindow?: (agentCmd: string, session: string) => void
   onSplitPane?: (agentCmd: string, session: string) => void
   paneCount?: number
@@ -29,8 +29,9 @@ export function HudHeader({
 }: HudHeaderProps) {
   const [showMenu, setShowMenu] = useState(false)
   const [agents, setAgents] = useState<AgentDef[]>([])
-  const [menuMode, setMenuMode] = useState<"main" | "new-window" | "split">("main")
+  const [menuMode, setMenuMode] = useState<"main" | "new-session" | "new-window" | "split">("main")
   const [selectedAgent, setSelectedAgent] = useState<AgentDef | null>(null)
+  const [cwdInput, setCwdInput] = useState("~")
   const menuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -54,6 +55,7 @@ export function HudHeader({
     setShowMenu(false)
     setMenuMode("main")
     setSelectedAgent(null)
+    setCwdInput("~")
   }
 
   return (
@@ -125,8 +127,9 @@ export function HudHeader({
                       key={`new-${agent.cmd}`}
                       onClick={(e) => {
                         e.stopPropagation()
-                        onAddTask?.(agent.cmd, agent.label)
-                        closeMenu()
+                        setSelectedAgent(agent)
+                        setCwdInput("~")
+                        setMenuMode("new-session")
                       }}
                       className="w-full px-3 py-2 flex items-center hover:bg-cyan-500/20
                                  transition-colors duration-150 group/item border-b border-cyan-500/10"
@@ -191,6 +194,55 @@ export function HudHeader({
                   {agents.length === 0 && (
                     <div className="px-3 py-2.5 text-xs font-mono text-cyan-600/50">Loading agents...</div>
                   )}
+                </>
+              )}
+
+              {/* New session with directory picker */}
+              {menuMode === "new-session" && selectedAgent && (
+                <>
+                  <div className="px-3 py-2 border-b border-cyan-500/20 flex items-center gap-2">
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setMenuMode("main") }}
+                      className="text-cyan-400 hover:text-cyan-200 text-xs font-mono"
+                    >
+                      ←
+                    </button>
+                    <span className="text-[10px] font-mono text-cyan-500/60 uppercase tracking-widest">
+                      New {selectedAgent.label} → Directory
+                    </span>
+                  </div>
+                  <div className="px-3 py-3 space-y-2" onClick={(e) => e.stopPropagation()}>
+                    <label className="text-[10px] font-mono text-cyan-500/60 uppercase tracking-widest">
+                      Working Directory
+                    </label>
+                    <input
+                      type="text"
+                      value={cwdInput}
+                      onChange={(e) => setCwdInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          onAddTask?.(selectedAgent.cmd, selectedAgent.label, cwdInput || undefined)
+                          closeMenu()
+                        }
+                      }}
+                      placeholder="~/projects/my-app"
+                      className="w-full px-2 py-1.5 bg-slate-950 border border-cyan-700/40 rounded-sm
+                                 text-sm font-mono text-cyan-200 placeholder:text-cyan-700/40
+                                 focus:outline-none focus:border-cyan-500/60"
+                      autoFocus
+                    />
+                    <button
+                      onClick={() => {
+                        onAddTask?.(selectedAgent.cmd, selectedAgent.label, cwdInput || undefined)
+                        closeMenu()
+                      }}
+                      className="w-full px-3 py-1.5 bg-cyan-500/20 border border-cyan-500/40 rounded-sm
+                                 text-xs font-mono text-cyan-200 uppercase tracking-wider
+                                 hover:bg-cyan-500/30 transition-colors"
+                    >
+                      Launch
+                    </button>
+                  </div>
                 </>
               )}
 

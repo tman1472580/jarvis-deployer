@@ -16,7 +16,7 @@ export interface TaskData {
   target: string
   pane_id: string
   model: string
-  agent_type: "claude" | "gemini" | "codex"
+  agent_type: "claude" | "gemini" | "codex" | "devin"
   contextUsed: number
   contextTotal: number
   turns: number

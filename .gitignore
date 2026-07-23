@@ -4,3 +4,14 @@
 node_modules/
 __pycache__/
 frontend/out/
+
+# PyInstaller build artifacts and packaged apps
+build/
+dist/
+*.spec.bak
+
+# Claude Code local worktrees / tooling state
+.claude/
+
+# TypeScript incremental build info
+frontend/tsconfig.tsbuildinfo

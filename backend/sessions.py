@@ -5,6 +5,7 @@ JSONL session data loading and usage statistics.
 import glob
 import json
 import os
+import re
 import time
 from datetime import datetime
 
@@ -12,11 +13,14 @@ from datetime import datetime
 CONTEXT_WINDOW = 200_000
 CLAUDE_DIR = os.path.expanduser("~/.claude")
 PROJECTS_DIR = os.path.join(CLAUDE_DIR, "projects")
+CODEX_DIR = os.path.expanduser("~/.codex")
+CODEX_SESSIONS_DIR = os.path.join(CODEX_DIR, "sessions")
 
 
 # ── JSONL session data ──────────────────────────────────────────────────
 def _load_all_sessions():
     sessions = {}
+    sessions.update(_load_codex_sessions())
     for proj_dir in glob.glob(os.path.join(PROJECTS_DIR, "*")):
         if not os.path.isdir(proj_dir):
             continue
@@ -29,10 +33,77 @@ def _load_all_sessions():
     return sessions
 
 
+def _load_codex_sessions():
+    sessions = {}
+    pattern = os.path.join(CODEX_SESSIONS_DIR, "**", "*.jsonl")
+    for jf in glob.glob(pattern, recursive=True):
+        try:
+            sessions[f"codex:{os.path.basename(jf).replace('.jsonl', '')}"] = (
+                _parse_codex_session_jsonl(jf)
+            )
+        except Exception:
+            continue
+    return sessions
+
+
+def _parse_codex_session_jsonl(path):
+    first_user_text = None
+    user_messages = []
+    last_token = None
+    last_rate_limits = None
+    context_window = CONTEXT_WINDOW
+    num_turns = 0
+    cwd = None
+
+    with open(path) as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = d.get("payload", {})
+            if d.get("type") == "session_meta":
+                cwd = payload.get("cwd", cwd)
+            if d.get("type") == "event_msg" and payload.get("type") == "user_message":
+                t = payload.get("message") or ""
+                if t and not t.startswith("/"):
+                    if first_user_text is None:
+                        first_user_text = t
+                    user_messages.append(t)
+            if d.get("type") == "event_msg" and payload.get("type") == "token_count":
+                info = payload.get("info", {})
+                last_token = info
+                last_rate_limits = payload.get("rate_limits")
+                context_window = info.get("model_context_window") or context_window
+                num_turns += 1
+
+    usage = (last_token or {}).get("last_token_usage", {})
+    total_usage = (last_token or {}).get("total_token_usage", {})
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+
+    return dict(
+        agent_type="codex",
+        model=None,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        context_window=context_window,
+        ctx_pct=round(input_tokens / context_window * 100, 1) if context_window else 0,
+        first_user_msg=first_user_text or "",
+        user_messages=user_messages,
+        total_output=total_usage.get("output_tokens", 0),
+        num_turns=num_turns,
+        rate_limits=last_rate_limits,
+        mtime=os.path.getmtime(path),
+        cwd=cwd,
+    )
+
+
 def _parse_session_jsonl(path):
     last_usage = None
     model = None
     first_user_text = None
+    user_messages = []
     total_output = 0
     num_turns = 0
 
@@ -43,8 +114,12 @@ def _parse_session_jsonl(path):
             except json.JSONDecodeError:
                 continue
             msg = d.get("message", {})
-            if first_user_text is None and d.get("type") == "user":
-                first_user_text = _extract_text(msg)
+            if d.get("type") == "user":
+                t = _extract_text(msg)
+                if t and not t.startswith("/"):
+                    if first_user_text is None:
+                        first_user_text = t
+                    user_messages.append(t)
             if isinstance(msg, dict) and "usage" in msg:
                 last_usage = msg["usage"]
                 model = msg.get("model", model)
@@ -54,6 +129,7 @@ def _parse_session_jsonl(path):
     if not last_usage:
         return dict(model=model, input_tokens=0, output_tokens=0,
                     ctx_pct=0, first_user_msg=first_user_text or "",
+                    user_messages=user_messages,
                     total_output=0, num_turns=0)
 
     inp = last_usage.get("input_tokens", 0)
@@ -66,42 +142,61 @@ def _parse_session_jsonl(path):
         output_tokens=last_usage.get("output_tokens", 0),
         ctx_pct=round(total_ctx / CONTEXT_WINDOW * 100, 1) if CONTEXT_WINDOW else 0,
         first_user_msg=first_user_text or "",
+        user_messages=user_messages,
         total_output=total_output, num_turns=num_turns,
     )
 
 
 def _extract_text(msg):
+    raw = ""
     if isinstance(msg, str):
-        return msg
-    if isinstance(msg, dict):
+        raw = msg
+    elif isinstance(msg, dict):
         content = msg.get("content", "")
         if isinstance(content, str):
-            return content
-        if isinstance(content, list):
+            raw = content
+        elif isinstance(content, list):
             for c in content:
                 if isinstance(c, dict) and c.get("type") == "text":
-                    return c.get("text", "")
-    return ""
+                    raw = c.get("text", "")
+                    break
+    cleaned = re.sub(r"<[^>]+>", "", raw).strip()
+    if cleaned.startswith("Caveat:") or not cleaned:
+        return ""
+    return cleaned
 
 
 def match_pane_to_session(pane_info, sessions):
+    if pane_info.get("agent_type") == "codex":
+        codex_sessions = [
+            (sid, sdata) for sid, sdata in sessions.items()
+            if sdata.get("agent_type") == "codex"
+        ]
+        if codex_sessions and not pane_info.get("first_user_msg"):
+            return max(codex_sessions, key=lambda item: item[1].get("mtime", 0))[0]
+
     pane_msg = pane_info.get("first_user_msg", "")
     if not pane_msg:
         return None
     pane_msg_lower = pane_msg.lower().strip()
     best_sid, best_score = None, 0
     for sid, sdata in sessions.items():
-        s_msg = sdata.get("first_user_msg", "").lower().strip()
-        if not s_msg:
-            continue
-        if pane_msg_lower in s_msg or s_msg.startswith(pane_msg_lower[:30]):
-            score = len(pane_msg_lower)
-        elif s_msg in pane_msg_lower:
-            score = len(s_msg)
-        else:
-            continue
-        if score > best_score:
-            best_score, best_sid = score, sid
+        msgs = sdata.get("user_messages", [])
+        if not msgs:
+            s = sdata.get("first_user_msg", "")
+            msgs = [s] if s else []
+        for s_msg_raw in msgs:
+            s_msg = s_msg_raw.lower().strip()
+            if not s_msg:
+                continue
+            if pane_msg_lower in s_msg or s_msg.startswith(pane_msg_lower[:30]):
+                score = len(pane_msg_lower)
+            elif s_msg in pane_msg_lower:
+                score = len(s_msg)
+            else:
+                continue
+            if score > best_score:
+                best_score, best_sid = score, sid
     return best_sid
 
 
@@ -120,6 +215,11 @@ def _load_usage_stats():
         "subscription": None, "tier": None,
         "five_h_pct": None, "seven_d_pct": None,
         "five_h_resets": None, "seven_d_resets": None,
+        "codex_primary_pct": None, "codex_primary_resets": None,
+        "codex_primary_window": None,
+        "codex_secondary_pct": None, "codex_secondary_resets": None,
+        "codex_secondary_window": None,
+        "codex_plan": None,
     }
 
     # Read credentials for subscription info
@@ -192,8 +292,50 @@ def _load_usage_stats():
     # Merge rate limits from local file (much more reliable than scraping)
     rl = _read_rate_limits()
     stats.update(rl)
+    stats.update(_read_codex_rate_limits())
 
     return stats
+
+
+def _fmt_window(minutes):
+    if minutes is None:
+        return None
+    if minutes % 10080 == 0:
+        weeks = minutes // 10080
+        return "7d" if weeks == 1 else f"{weeks}w"
+    if minutes % 1440 == 0:
+        days = minutes // 1440
+        return "24h" if days == 1 else f"{days}d"
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
+def _read_codex_rate_limits():
+    result = {
+        "codex_primary_pct": None, "codex_primary_resets": None,
+        "codex_primary_window": None,
+        "codex_secondary_pct": None, "codex_secondary_resets": None,
+        "codex_secondary_window": None,
+        "codex_plan": None,
+    }
+    codex_sessions = _load_codex_sessions()
+    latest = max(codex_sessions.values(), key=lambda s: s.get("mtime", 0), default=None)
+    if not latest:
+        return result
+    rl = latest.get("rate_limits") or {}
+    result["codex_plan"] = rl.get("plan_type")
+    for prefix, data in (("primary", rl.get("primary")), ("secondary", rl.get("secondary"))):
+        if not isinstance(data, dict):
+            continue
+        out_prefix = f"codex_{prefix}"
+        result[f"{out_prefix}_pct"] = data.get("used_percent")
+        result[f"{out_prefix}_window"] = _fmt_window(data.get("window_minutes"))
+        if data.get("resets_at"):
+            result[f"{out_prefix}_resets"] = datetime.fromtimestamp(
+                data["resets_at"]).strftime("Resets %a %I:%M %p")
+    return result
 
 
 def _read_rate_limits():
